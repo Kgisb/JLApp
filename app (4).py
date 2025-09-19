@@ -47,9 +47,9 @@ st.markdown(
 
 # ---------- Color palette ----------
 PALETTE = {
-    "Total": "#6b7280",
-    "AI Coding": "#2563eb",
-    "Math": "#16a34a",
+    "Total": "#6b7280",      # gray-500
+    "AI Coding": "#2563eb",  # blue-600
+    "Math": "#16a34a",       # green-600
 }
 
 # ----------------------------
@@ -249,33 +249,43 @@ def prepare_conversion_for_range(
 # ---------- GAUGE (speedometer) CHART ----------
 def gauge_chart(percent: float, title: str, color_hex: str, numerator: int, denominator: int):
     """
-    Semi-donut gauge using Altair arcs:
-      - value slice (color_hex)
-      - remainder slice (light gray)
-      - center label with % (1 decimal) and title below
+    Semi-donut gauge using Altair arcs with startAngle/endAngle encodings (valid schema).
+    - The semi circle spans from -π to 0.
+    - We split into two arcs: 'value' and 'rest'.
     """
     p = max(0.0, min(100.0, float(percent)))
+    start_all = -math.pi
+    end_all = 0.0
+    sweep = end_all - start_all  # = π
+
+    # angles for the split point
+    split_angle = start_all + sweep * (p / 100.0)
+
     data = pd.DataFrame({
         "part": ["value", "rest"],
-        "val": [p, 100 - p],
-        "color": [color_hex, "#e5e7eb"]
+        "start": [start_all, split_angle],
+        "end":   [split_angle, end_all],
+        "num":   [numerator, numerator],
+        "den":   [denominator, denominator],
     })
 
     base = alt.Chart(data).mark_arc(
-        innerRadius=70, outerRadius=110,
-        startAngle=-math.pi, endAngle=0
+        innerRadius=70, outerRadius=110
     ).encode(
-        theta=alt.Theta("val:Q", stack=True),
-        color=alt.Color("part:N",
-                        scale=alt.Scale(domain=["value", "rest"], range=[color_hex, "#e5e7eb"]),
-                        legend=None),
+        startAngle="start:Q",
+        endAngle="end:Q",
+        color=alt.Color(
+            "part:N",
+            scale=alt.Scale(domain=["value", "rest"], range=[color_hex, "#e5e7eb"]),
+            legend=None
+        ),
         tooltip=[
-            alt.Tooltip("val:Q", title="Slice", format=".1f"),
-            alt.Tooltip(value=f"{numerator}", title="Numerator"),
-            alt.Tooltip(value=f"{denominator}", title="Denominator"),
-            alt.Tooltip(value=f"{p:.1f}%", title="Conversion %"),
-            alt.Tooltip(value=title, title="Series"),
-        ]
+            alt.Tooltip("part:N", title="Slice"),
+            alt.Tooltip("num:Q", title="Numerator"),
+            alt.Tooltip("den:Q", title="Denominator"),
+            alt.Tooltip(alt.value(f"{p:.1f}%"), title="Conversion %"),
+            alt.Tooltip(alt.value(title), title="Series"),
+        ],
     ).properties(width=240, height=150)
 
     # Center labels
@@ -290,9 +300,6 @@ def gauge_chart(percent: float, title: str, color_hex: str, numerator: int, deno
     return base + label_pct + label_title
 
 def gauge_row(title_left: str, pcts: dict, nums: dict, denom: int):
-    """
-    Render three gauges (Total, AI Coding, Math) in a row.
-    """
     st.markdown(f"<div class='section-title'>{title_left}</div>", unsafe_allow_html=True)
     colA, colB, colC = st.columns(3)
     with colA:
@@ -302,7 +309,7 @@ def gauge_row(title_left: str, pcts: dict, nums: dict, denom: int):
     with colC:
         st.altair_chart(gauge_chart(pcts["Math"], "Math", PALETTE["Math"], nums["Math"], denom), use_container_width=True)
 
-# ---------- BUBBLES FOR COUNTS (unchanged) ----------
+# ---------- BUBBLES FOR COUNTS ----------
 def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
     data = pd.DataFrame({
         "Label": ["Total", "AI Coding", "Math"],
