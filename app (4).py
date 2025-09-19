@@ -10,6 +10,43 @@ st.set_page_config(
     layout="wide",
 )
 
+# ---------- Global UI styling ----------
+st.markdown(
+    """
+    <style>
+      /* Card-like look for Altair charts */
+      .stAltairChart {
+        border: 1px solid #e5e7eb;            /* gray-200 */
+        border-radius: 16px;
+        padding: 12px;
+        background: #ffffff;
+        box-shadow: 0 1px 3px rgba(15,23,42,.08); /* subtle shadow */
+      }
+      /* Legend pills */
+      .legend-pill {
+        display: inline-block;
+        padding: 6px 12px;
+        border-radius: 999px;
+        margin-right: 10px;
+        font-weight: 600;
+        font-size: 0.9rem;
+        color: #111827; /* gray-900 */
+      }
+      .pill-total { background: #e5e7eb; }    /* gray-200 for Total */
+      .pill-ai    { background: #bfdbfe; }    /* blue-200 for AI Coding */
+      .pill-math  { background: #bbf7d0; }    /* green-200 for Math */
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+# ---------- Professional color palette ----------
+PALETTE = {
+    "Total": "#6b7280",      # gray-500
+    "AI Coding": "#2563eb",  # blue-600
+    "Math": "#16a34a",       # green-600
+}
+
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -141,18 +178,21 @@ def bubble_chart(title: str, total: int, ai_cnt: int, math_cnt: int):
         "Col": [0.5, 0.33, 0.66],
     })
 
+    color_domain = ["Total", "AI Coding", "Math"]
+    color_range  = [PALETTE["Total"], PALETTE["AI Coding"], PALETTE["Math"]]
+
     base = alt.Chart(data).encode(
         x=alt.X("Col:Q", axis=None, scale=alt.Scale(domain=(0, 1))),
         y=alt.Y("Row:Q", axis=None, scale=alt.Scale(domain=(-0.2, 1.2))),
         tooltip=[alt.Tooltip("Label:N"), alt.Tooltip("Value:Q")],
     )
 
-    circles = base.mark_circle(opacity=0.65).encode(
+    circles = base.mark_circle(opacity=0.8).encode(
         size=alt.Size("Value:Q", scale=alt.Scale(range=[300, 6500]), legend=None),
-        color=alt.Color("Label:N", legend=None),
+        color=alt.Color("Label:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
     )
 
-    text = base.mark_text(fontWeight="bold", dy=0).encode(
+    text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(
         text=alt.Text("Value:Q")
     )
 
@@ -167,9 +207,21 @@ with st.sidebar:
     st.caption("Use the quick period tabs and filters on the main panel.")
 
 st.title("📊 JetLearn MIS")
+
+# Legend (visible mapping of colors)
+st.markdown(
+    """
+    <div>
+      <span class="legend-pill pill-ai">AI-Coding</span>
+      <span class="legend-pill pill-math">Math</span>
+      <span class="legend-pill pill-total">Total (Both)</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 st.write(
     "Shows **Enrolments (Payments)** at two levels — **MTD (same-month created)** and **Cohort (payments in period)** — "
-    "split by **Pipeline** into **AI Coding** and **Math**."
+    "split by **Pipeline** into **AI-Coding** and **Math**."
 )
 
 # --- Load data
