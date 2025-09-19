@@ -5,7 +5,7 @@ import altair as alt
 from datetime import datetime, date, timedelta
 
 st.set_page_config(
-    page_title="JetLearn MIS – Enrolments (MTD & Cohort)",
+    page_title="JetLearn MIS – Enrolments (MTD & Cohort) + Conversion%",
     page_icon="📊",
     layout="wide",
 )
@@ -20,7 +20,7 @@ st.markdown(
         border-radius: 16px;
         padding: 12px;
         background: #ffffff;
-        box-shadow: 0 1px 3px rgba(15,23,42,.08); /* subtle shadow */
+        box-shadow: 0 1px 3px rgba(15,23,42,.08);
       }
       /* Legend pills */
       .legend-pill {
@@ -126,6 +126,7 @@ def apply_filters(
             f = f[f[source_col].astype(str).isin(sel_sources)]
     return f
 
+# ---------- COUNT LOGIC (existing MIS) ----------
 def prepare_counts_for_range(
     df: pd.DataFrame,
     start_d: date,
@@ -170,32 +171,124 @@ def prepare_counts_for_range(
     }
     return mtd_counts, cohort_counts
 
-def bubble_chart(title: str, total: int, ai_cnt: int, math_cnt: int):
+# ---------- CONVERSION% LOGIC ----------
+def deals_created_in_running_month(df: pd.DataFrame, running_month_any_date: date, create_col: str) -> int:
+    """Denominator: number of deals created in the running month (post-filter)."""
+    df = df.copy()
+    df["_create_dt"] = coerce_datetime(df[create_col])
+    m_start, m_end = month_bounds(running_month_any_date)
+    return int(df["_create_dt"].dt.date.between(m_start, m_end).sum())
+
+def prepare_conversion_for_range(
+    df: pd.DataFrame,
+    start_d: date,
+    end_d: date,
+    running_month_any_date: date,
+    create_col: str,
+    pay_col: str,
+    pipeline_col: str | None
+):
+    """
+    Returns two dicts with % values (0..100) for MTD% and Cohort%:
+      - Denominator: # deals created in running month (after filters)
+      - MTD% numerator: payments in [start_d,end_d] AND created in running month
+      - Cohort% numerator: payments in [start_d,end_d] (any create month)
+    Each dict has keys: 'Total', 'AI Coding', 'Math'
+    """
+    df = df.copy()
+    df["_create_dt"] = coerce_datetime(df[create_col])
+    df["_pay_dt"] = coerce_datetime(df[pay_col])
+
+    # denominator
+    denom = deals_created_in_running_month(df, running_month_any_date, create_col)
+    if denom == 0:
+        # Avoid division by zero; return zeros
+        zero = {"Total": 0.0, "AI Coding": 0.0, "Math": 0.0}
+        return zero, zero, 0
+
+    # payments in period
+    in_range_pay = df["_pay_dt"].dt.date.between(start_d, end_d)
+
+    # running-month created flag
+    m_start, m_end = month_bounds(running_month_any_date)
+    in_running_month_create = df["_create_dt"].dt.date.between(m_start, m_end)
+
+    # Numerators
+    mtd_df = df.loc[in_range_pay & in_running_month_create]
+    cohort_df = df.loc[in_range_pay]
+
+    if pipeline_col and pipeline_col in df.columns:
+        mtd_split = mtd_df[pipeline_col].map(normalize_pipeline).fillna("Other")
+        cohort_split = cohort_df[pipeline_col].map(normalize_pipeline).fillna("Other")
+        mtd_ai = int((pd.Series(mtd_split) == "AI Coding").sum())
+        mtd_math = int((pd.Series(mtd_split) == "Math").sum())
+        coh_ai = int((pd.Series(cohort_split) == "AI Coding").sum())
+        coh_math = int((pd.Series(cohort_split) == "Math").sum())
+    else:
+        mtd_ai = mtd_math = coh_ai = coh_math = 0
+
+    mtd_total = int(len(mtd_df))
+    coh_total = int(len(cohort_df))
+
+    # Convert to %
+    mtd_pct = {
+        "Total": round(100.0 * mtd_total / denom, 2),
+        "AI Coding": round(100.0 * mtd_ai / denom, 2),
+        "Math": round(100.0 * mtd_math / denom, 2),
+    }
+    cohort_pct = {
+        "Total": round(100.0 * coh_total / denom, 2),
+        "AI Coding": round(100.0 * coh_ai / denom, 2),
+        "Math": round(100.0 * coh_math / denom, 2),
+    }
+    return mtd_pct, cohort_pct, denom
+
+# ---------- CHARTS ----------
+def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
     data = pd.DataFrame({
         "Label": ["Total", "AI Coding", "Math"],
         "Value": [total, ai_cnt, math_cnt],
         "Row": [0, 1, 1],
         "Col": [0.5, 0.33, 0.66],
     })
-
     color_domain = ["Total", "AI Coding", "Math"]
     color_range  = [PALETTE["Total"], PALETTE["AI Coding"], PALETTE["Math"]]
-
     base = alt.Chart(data).encode(
         x=alt.X("Col:Q", axis=None, scale=alt.Scale(domain=(0, 1))),
         y=alt.Y("Row:Q", axis=None, scale=alt.Scale(domain=(-0.2, 1.2))),
         tooltip=[alt.Tooltip("Label:N"), alt.Tooltip("Value:Q")],
     )
-
     circles = base.mark_circle(opacity=0.8).encode(
         size=alt.Size("Value:Q", scale=alt.Scale(range=[300, 6500]), legend=None),
         color=alt.Color("Label:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
     )
+    text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text=alt.Text("Value:Q"))
+    return (circles + text).properties(height=340, title=title)
 
-    text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(
-        text=alt.Text("Value:Q")
+def bubble_chart_pct(title: str, total_pct: float, ai_pct: float, math_pct: float):
+    """Bubble chart for percent values (0..100)."""
+    data = pd.DataFrame({
+        "Label": ["Total", "AI Coding", "Math"],
+        "Pct": [total_pct, ai_pct, math_pct],
+        "PctLabel": [f"{total_pct:.1f}%", f"{ai_pct:.1f}%", f"{math_pct:.1f}%"],
+        "Row": [0, 1, 1],
+        "Col": [0.5, 0.33, 0.66],
+    })
+    color_domain = ["Total", "AI Coding", "Math"]
+    color_range  = [PALETTE["Total"], PALETTE["AI Coding"], PALETTE["Math"]]
+    base = alt.Chart(data).encode(
+        x=alt.X("Col:Q", axis=None, scale=alt.Scale(domain=(0, 1))),
+        y=alt.Y("Row:Q", axis=None, scale=alt.Scale(domain=(-0.2, 1.2))),
+        tooltip=[
+            alt.Tooltip("Label:N"),
+            alt.Tooltip("Pct:Q", title="Conversion %", format=".2f")
+        ],
     )
-
+    circles = base.mark_circle(opacity=0.85).encode(
+        size=alt.Size("Pct:Q", scale=alt.Scale(domain=[0, 100], range=[300, 6500]), legend=None),
+        color=alt.Color("Label:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
+    )
+    text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text="PctLabel:N")
     return (circles + text).properties(height=340, title=title)
 
 # ----------------------------
@@ -207,8 +300,6 @@ with st.sidebar:
     st.caption("Use the quick period tabs and filters on the main panel.")
 
 st.title("📊 JetLearn MIS")
-
-# Legend (visible mapping of colors)
 st.markdown(
     """
     <div>
@@ -221,7 +312,8 @@ st.markdown(
 )
 st.write(
     "Shows **Enrolments (Payments)** at two levels — **MTD (same-month created)** and **Cohort (payments in period)** — "
-    "split by **Pipeline** into **AI-Coding** and **Math**."
+    "split by **Pipeline** into **AI-Coding** and **Math**. Below that, the **Conversion%** uses the same logic with "
+    "denominator = **# deals created in the period’s running month**."
 )
 
 # --- Load data
@@ -290,91 +382,75 @@ st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
 show_all = st.checkbox("Show all periods (Yesterday • Today • Last Month • This Month)", value=False, help="Toggle to view all periods together.")
 
 # ----------------------------
-# Period sections
+# Period sections (Counts + Conversion%)
 # ----------------------------
+def render_period_block(title: str, range_start: date, range_end: date, running_month_anchor: date):
+    st.markdown(f"#### {title}")
+
+    # Counts
+    mtd_counts, coh_counts = prepare_counts_for_range(
+        df_f, range_start, range_end, running_month_anchor,
+        create_col, pay_col, pipeline_col
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.altair_chart(
+            bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"]),
+            use_container_width=True
+        )
+    with c2:
+        st.altair_chart(
+            bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]),
+            use_container_width=True
+        )
+
+    # Conversion %
+    mtd_pct, coh_pct, denom = prepare_conversion_for_range(
+        df_f, range_start, range_end, running_month_anchor,
+        create_col, pay_col, pipeline_col
+    )
+
+    st.caption(f"Conversion% denominator (deals created in running month): **{denom:,}**")
+    c3, c4 = st.columns(2)
+    with c3:
+        st.altair_chart(
+            bubble_chart_pct("MTD Conversion %", mtd_pct["Total"], mtd_pct["AI Coding"], mtd_pct["Math"]),
+            use_container_width=True
+        )
+    with c4:
+        st.altair_chart(
+            bubble_chart_pct("Cohort Conversion %", coh_pct["Total"], coh_pct["AI Coding"], coh_pct["Math"]),
+            use_container_width=True
+        )
+
 if view == "MIS":
     if show_all:
         st.subheader("All Periods")
         colA, colB = st.columns(2)
 
-        # Yesterday + Last Month
         with colA:
-            st.markdown("#### Yesterday")
-            mtd, coh = prepare_counts_for_range(df_f, yday, yday, yday, create_col, pay_col, pipeline_col)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.altair_chart(bubble_chart("MTD (Yesterday context)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
-            with c2:
-                st.altair_chart(bubble_chart("Cohort (Yesterday payments)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
-
+            render_period_block("Yesterday", yday, yday, yday)
             st.divider()
+            render_period_block("Last Month", last_m_start, last_m_end, last_m_start)
 
-            st.markdown("#### Last Month")
-            mtd, coh = prepare_counts_for_range(df_f, last_m_start, last_m_end, last_m_start, create_col, pay_col, pipeline_col)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.altair_chart(bubble_chart("MTD (Last Month)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
-            with c2:
-                st.altair_chart(bubble_chart("Cohort (Last Month)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
-
-        # Today + This Month
         with colB:
-            st.markdown("#### Today")
-            mtd, coh = prepare_counts_for_range(df_f, today, today, today, create_col, pay_col, pipeline_col)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.altair_chart(bubble_chart("MTD (Today context)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
-            with c2:
-                st.altair_chart(bubble_chart("Cohort (Today payments)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
-
+            render_period_block("Today", today, today, today)
             st.divider()
-
-            st.markdown("#### This Month")
-            mtd, coh = prepare_counts_for_range(df_f, this_m_start, this_m_end, this_m_start, create_col, pay_col, pipeline_col)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.altair_chart(bubble_chart("MTD (This Month)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
-            with c2:
-                st.altair_chart(bubble_chart("Cohort (This Month)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
-
+            render_period_block("This Month", this_m_start, this_m_end, this_m_start)
     else:
         tabs = st.tabs(["Yesterday", "Today", "Last Month", "This Month"])
 
         with tabs[0]:
-            st.markdown("### Yesterday")
-            mtd, coh = prepare_counts_for_range(df_f, yday, yday, yday, create_col, pay_col, pipeline_col)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.altair_chart(bubble_chart("MTD (Yesterday context)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
-            with c2:
-                st.altair_chart(bubble_chart("Cohort (Yesterday payments)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
+            render_period_block("Yesterday", yday, yday, yday)
 
         with tabs[1]:
-            st.markdown("### Today")
-            mtd, coh = prepare_counts_for_range(df_f, today, today, today, create_col, pay_col, pipeline_col)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.altair_chart(bubble_chart("MTD (Today context)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
-            with c2:
-                st.altair_chart(bubble_chart("Cohort (Today payments)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
+            render_period_block("Today", today, today, today)
 
         with tabs[2]:
-            st.markdown("### Last Month")
-            mtd, coh = prepare_counts_for_range(df_f, last_m_start, last_m_end, last_m_start, create_col, pay_col, pipeline_col)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.altair_chart(bubble_chart("MTD (Last Month)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
-            with c2:
-                st.altair_chart(bubble_chart("Cohort (Last Month)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
+            render_period_block("Last Month", last_m_start, last_m_end, last_m_start)
 
         with tabs[3]:
-            st.markdown("### This Month")
-            mtd, coh = prepare_counts_for_range(df_f, this_m_start, this_m_end, this_m_start, create_col, pay_col, pipeline_col)
-            c1, c2 = st.columns(2)
-            with c1:
-                st.altair_chart(bubble_chart("MTD (This Month)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
-            with c2:
-                st.altair_chart(bubble_chart("Cohort (This Month)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
+            render_period_block("This Month", this_m_start, this_m_end, this_m_start)
 
 # Optional: data preview
 with st.expander("Data preview & column mapping", expanded=False):
