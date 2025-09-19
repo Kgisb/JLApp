@@ -48,8 +48,8 @@ st.markdown(
 # ---------- Color palette ----------
 PALETTE = {
     "Total": "#6b7280",      # gray-500
-    "AI Coding": "#2563eb",  # blue-600 (we'll use for MTD line)
-    "Math": "#16a34a",       # green-600 (we'll use for Cohort line)
+    "AI Coding": "#2563eb",  # blue-600
+    "Math": "#16a34a",       # green-600
 }
 
 # ----------------------------
@@ -116,12 +116,15 @@ def apply_filters(
     sel_sources: list[str],
 ) -> pd.DataFrame:
     f = df.copy()
-    if counsellor_col and len(sel_counsellors) > 0 and "All" not in sel_counsellors:
-        f = f[f[counsellor_col].astype(str).isin(sel_counsellors)]
-    if country_col and len(sel_countries) > 0 and "All" not in sel_countries:
-        f = f[f[country_col].astype(str).isin(sel_countries)]
-    if source_col and len(sel_sources) > 0 and "All" not in sel_sources:
-        f = f[f[source_col].astype(str).isin(sel_sources)]
+    if counsellor_col and len(sel_counsellors) > 0:
+        if "All" not in sel_counsellors:
+            f = f[f[counsellor_col].astype(str).isin(sel_counsellors)]
+    if country_col and len(sel_countries) > 0:
+        if "All" not in sel_countries:
+            f = f[f[country_col].astype(str).isin(sel_countries)]
+    if source_col and len(sel_sources) > 0:
+        if "All" not in sel_sources:
+            f = f[f[source_col].astype(str).isin(sel_sources)]
     return f
 
 # ---------- COUNT LOGIC ----------
@@ -134,7 +137,10 @@ def prepare_counts_for_range(
     pay_col: str,
     pipeline_col: str | None
 ):
-    """(mtd_counts, cohort_counts)"""
+    """(mtd_counts, cohort_counts) where:
+       - Cohort: payments with pay date in [start_d, end_d]
+       - MTD: payments in [start_d, end_d] AND create date in same month as month_for_mtd
+    """
     df = df.copy()
     df["_create_dt"] = coerce_datetime(df[create_col])
     df["_pay_dt"] = coerce_datetime(df[pay_col])
@@ -190,7 +196,9 @@ def prepare_conversion_for_range(
     denom_start: date | None = None,             # required if denom_mode="range"
     denom_end: date | None = None
 ):
-    """Returns (mtd_pct, coh_pct, denom, numerators)"""
+    """
+    Returns (mtd_pct, coh_pct, denom, numerators)
+    """
     df = df.copy()
     df["_create_dt"] = coerce_datetime(df[create_col])
     df["_pay_dt"] = coerce_datetime(df[pay_col])
@@ -236,39 +244,30 @@ def prepare_conversion_for_range(
     }
     return mtd_pct, coh_pct, denom, numerators
 
-# ---------- GAUGE (speedometer) CHART ----------
+# ---------- GAUGE (semi-donut) ----------
 def gauge_chart(percent: float, title: str, color_hex: str, numerator: int, denominator: int):
-    """Semi-donut gauge using startAngle/endAngle encodings."""
+    """
+    Semi-donut using theta with angle range [-π, 0] (no startAngle/endAngle encodings).
+    """
     p = max(0.0, min(100.0, float(percent)))
-    start_all = -math.pi
-    end_all = 0.0
-    sweep = end_all - start_all  # = π
-    split_angle = start_all + sweep * (p / 100.0)
-
     data = pd.DataFrame({
         "part": ["value", "rest"],
-        "start": [start_all, split_angle],
-        "end":   [split_angle, end_all],
-        "num":   [numerator, numerator],
-        "den":   [denominator, denominator],
+        "val":  [p, 100 - p],
+        "series": [title, title],
+        "num": [numerator, numerator],
+        "den": [denominator, denominator],
+        "percent": [f"{p:.1f}%", f"{p:.1f}%"],
     })
 
-    base = alt.Chart(data).mark_arc(
-        innerRadius=70, outerRadius=110
-    ).encode(
-        startAngle="start:Q",
-        endAngle="end:Q",
-        color=alt.Color(
-            "part:N",
-            scale=alt.Scale(domain=["value", "rest"], range=[color_hex, "#e5e7eb"]),
-            legend=None
-        ),
+    base = alt.Chart(data).mark_arc(innerRadius=70, outerRadius=110).encode(
+        theta=alt.Theta("val:Q", stack=True, scale=alt.Scale(domain=[0, 100], range=[-math.pi, 0])),
+        color=alt.Color("part:N", scale=alt.Scale(domain=["value", "rest"], range=[color_hex, "#e5e7eb"]), legend=None),
         tooltip=[
+            alt.Tooltip("series:N", title="Series"),
             alt.Tooltip("part:N", title="Slice"),
             alt.Tooltip("num:Q", title="Numerator"),
             alt.Tooltip("den:Q", title="Denominator"),
-            alt.Tooltip(alt.value(f"{p:.1f}%"), title="Conversion %"),
-            alt.Tooltip(alt.value(title), title="Series"),
+            alt.Tooltip("percent:N", title="Conversion %"),
         ],
     ).properties(width=240, height=150)
 
@@ -288,11 +287,11 @@ def gauge_row(title_left: str, pcts: dict, nums: dict, denom: int):
     with colA:
         st.altair_chart(gauge_chart(pcts["Total"], "Total", PALETTE["Total"], nums["Total"], denom), use_container_width=True)
     with colB:
-        st.altair_chart(gauge_chart(pcts["AI Coding"], "MTD", PALETTE["AI Coding"], nums["AI Coding"], denom), use_container_width=True)
+        st.altair_chart(gauge_chart(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums["AI Coding"], denom), use_container_width=True)
     with colC:
-        st.altair_chart(gauge_chart(pcts["Math"], "Cohort", PALETTE["Math"], nums["Math"], denom), use_container_width=True)
+        st.altair_chart(gauge_chart(pcts["Math"], "Math", PALETTE["Math"], nums["Math"], denom), use_container_width=True)
 
-# ---------- COUNT BUBBLES (unchanged) ----------
+# ---------- BUBBLES FOR COUNTS ----------
 def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
     data = pd.DataFrame({
         "Label": ["Total", "AI Coding", "Math"],
@@ -314,7 +313,7 @@ def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
     text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text=alt.Text("Value:Q"))
     return (circles + text).properties(height=360, title=title)
 
-# ---------- TREND (combined: bar + 2 lines, dual Y) ----------
+# ---------- TREND (bar + two lines, dual y) ----------
 def trend_timeseries(
     df: pd.DataFrame,
     payments_start: date,
@@ -324,20 +323,13 @@ def trend_timeseries(
     running_month_anchor: date | None = None,
     denom_start: date | None = None,
     denom_end: date | None = None,
-    create_col: str,
-    pay_col: str
+    create_col: str = "Create Date",
+    pay_col: str = "Payment Received Date"
 ):
-    """
-    Returns a dataframe with Date, Leads (bars), MTD (line), Cohort (line), daily.
-    - Leads = # deals created in denominator period (by Create Date).
-    - MTD = # payments in [payments_start, payments_end] with Create Date within denominator.
-    - Cohort = # payments in [payments_start, payments_end] regardless of Create Date.
-    """
     df = df.copy()
     df["_create_dt"] = coerce_datetime(df[create_col]).dt.date
     df["_pay_dt"] = coerce_datetime(df[pay_col]).dt.date
 
-    # Build base date range = union of payments period and denom period
     base_start = payments_start
     base_end = payments_end
 
@@ -346,7 +338,6 @@ def trend_timeseries(
         base_end = max(base_end, denom_end)
         denom_mask = df["_create_dt"].between(denom_start, denom_end)
     else:
-        # anchor month
         if not running_month_anchor:
             running_month_anchor = payments_start
         m_start, m_end = month_bounds(running_month_anchor)
@@ -354,10 +345,8 @@ def trend_timeseries(
         base_end = max(base_end, m_end)
         denom_mask = df["_create_dt"].between(m_start, m_end)
 
-    # Daily index
     all_days = pd.date_range(base_start, base_end, freq="D").date
 
-    # Leads (Create Date within denom)
     leads = (
         df.loc[denom_mask]
           .groupby("_create_dt")
@@ -365,8 +354,6 @@ def trend_timeseries(
           .reindex(all_days, fill_value=0)
           .rename("Leads")
     )
-
-    # Cohort payments (any create month) within payments window
     pay_mask = df["_pay_dt"].between(payments_start, payments_end)
     cohort = (
         df.loc[pay_mask]
@@ -375,8 +362,6 @@ def trend_timeseries(
           .reindex(all_days, fill_value=0)
           .rename("Cohort")
     )
-
-    # MTD payments = pay in window AND created within denom
     mtd = (
         df.loc[pay_mask & denom_mask]
           .groupby("_pay_dt")
@@ -390,11 +375,6 @@ def trend_timeseries(
     return ts
 
 def trend_chart(ts: pd.DataFrame, title: str):
-    """
-    Combined chart:
-    - Bars (left y): Leads
-    - Lines (right y): MTD (blue), Cohort (green)
-    """
     base = alt.Chart(ts).encode(x=alt.X("Date:T", axis=alt.Axis(title=None)))
 
     bars = base.mark_bar(opacity=0.75).encode(
@@ -414,8 +394,7 @@ def trend_chart(ts: pd.DataFrame, title: str):
         tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Cohort:Q", title="Cohort Enrolments")]
     )
 
-    chart = alt.layer(bars, line_mtd, line_coh).resolve_scale(y='independent').properties(title=title)
-    return chart
+    return alt.layer(bars, line_mtd, line_coh).resolve_scale(y='independent').properties(title=title)
 
 # ----------------------------
 # UI
@@ -523,7 +502,7 @@ def render_period_block(title: str, range_start: date, range_end: date, running_
             use_container_width=True
         )
 
-    # Conversion% → Gauges (anchor month denominator)
+    # Conversion% → Gauges
     mtd_pct, coh_pct, denom, nums = prepare_conversion_for_range(
         df_f, range_start, range_end, create_col, pay_col, pipeline_col,
         denom_mode="anchor", running_month_anchor=running_month_anchor
