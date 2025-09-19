@@ -18,7 +18,7 @@ st.markdown(
       .stAltairChart {
         border: 1px solid #e5e7eb;            /* gray-200 */
         border-radius: 16px;
-        padding: 12px;
+        padding: 14px;
         background: #ffffff;
         box-shadow: 0 1px 3px rgba(15,23,42,.08);
       }
@@ -35,6 +35,14 @@ st.markdown(
       .pill-total { background: #e5e7eb; }    /* gray-200 for Total */
       .pill-ai    { background: #bfdbfe; }    /* blue-200 for AI Coding */
       .pill-math  { background: #bbf7d0; }    /* green-200 for Math */
+
+      /* Section titles */
+      .section-title {
+        font-weight: 700;
+        font-size: 1.05rem;
+        margin-top: .25rem;
+        margin-bottom: .25rem;
+      }
     </style>
     """,
     unsafe_allow_html=True,
@@ -53,12 +61,10 @@ PALETTE = {
 @st.cache_data(show_spinner=False)
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, low_memory=False)
-    # normalize columns (strip spaces)
-    df.columns = [c.strip() for c in df.columns]
+    df.columns = [c.strip() for c in df.columns]  # strip trailing spaces
     return df
 
 def find_col(df: pd.DataFrame, candidates):
-    """Find a column by name with case-insensitive / variant matching."""
     for c in candidates:
         if c in df.columns:
             return c
@@ -69,7 +75,6 @@ def find_col(df: pd.DataFrame, candidates):
     return None
 
 def coerce_datetime(series: pd.Series) -> pd.Series:
-    """Parse dates robustly with day-first and unix fallback."""
     s = pd.to_datetime(series, errors="coerce", infer_datetime_format=True, dayfirst=True)
     if s.notna().sum() == 0:
         try:
@@ -113,7 +118,6 @@ def apply_filters(
     sel_countries: list[str],
     sel_sources: list[str],
 ) -> pd.DataFrame:
-    """Apply 'All' or selected filters safely."""
     f = df.copy()
     if counsellor_col and len(sel_counsellors) > 0:
         if "All" not in sel_counsellors:
@@ -151,7 +155,6 @@ def prepare_counts_for_range(
     in_month_create = df["_create_dt"].dt.date.between(m_start, m_end)
     mtd_df = df.loc[in_range_pay & in_month_create]
 
-    # Pipeline split
     if pipeline_col and pipeline_col in df.columns:
         cohort_split = cohort_df[pipeline_col].map(normalize_pipeline).fillna("Other")
         mtd_split = mtd_df[pipeline_col].map(normalize_pipeline).fillna("Other")
@@ -173,7 +176,6 @@ def prepare_counts_for_range(
 
 # ---------- CONVERSION% LOGIC ----------
 def deals_created_in_running_month(df: pd.DataFrame, running_month_any_date: date, create_col: str) -> int:
-    """Denominator: number of deals created in the running month (post-filter)."""
     df = df.copy()
     df["_create_dt"] = coerce_datetime(df[create_col])
     m_start, m_end = month_bounds(running_month_any_date)
@@ -199,21 +201,16 @@ def prepare_conversion_for_range(
     df["_create_dt"] = coerce_datetime(df[create_col])
     df["_pay_dt"] = coerce_datetime(df[pay_col])
 
-    # denominator
     denom = deals_created_in_running_month(df, running_month_any_date, create_col)
     if denom == 0:
-        # Avoid division by zero; return zeros
         zero = {"Total": 0.0, "AI Coding": 0.0, "Math": 0.0}
         return zero, zero, 0
 
-    # payments in period
     in_range_pay = df["_pay_dt"].dt.date.between(start_d, end_d)
 
-    # running-month created flag
     m_start, m_end = month_bounds(running_month_any_date)
     in_running_month_create = df["_create_dt"].dt.date.between(m_start, m_end)
 
-    # Numerators
     mtd_df = df.loc[in_range_pay & in_running_month_create]
     cohort_df = df.loc[in_range_pay]
 
@@ -230,16 +227,16 @@ def prepare_conversion_for_range(
     mtd_total = int(len(mtd_df))
     coh_total = int(len(cohort_df))
 
-    # Convert to %
+    # Percent with one decimal
     mtd_pct = {
-        "Total": round(100.0 * mtd_total / denom, 2),
-        "AI Coding": round(100.0 * mtd_ai / denom, 2),
-        "Math": round(100.0 * mtd_math / denom, 2),
+        "Total": round(100.0 * mtd_total / denom, 1),
+        "AI Coding": round(100.0 * mtd_ai / denom, 1),
+        "Math": round(100.0 * mtd_math / denom, 1),
     }
     cohort_pct = {
-        "Total": round(100.0 * coh_total / denom, 2),
-        "AI Coding": round(100.0 * coh_ai / denom, 2),
-        "Math": round(100.0 * coh_math / denom, 2),
+        "Total": round(100.0 * coh_total / denom, 1),
+        "AI Coding": round(100.0 * coh_ai / denom, 1),
+        "Math": round(100.0 * coh_math / denom, 1),
     }
     return mtd_pct, cohort_pct, denom
 
@@ -258,15 +255,15 @@ def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
         y=alt.Y("Row:Q", axis=None, scale=alt.Scale(domain=(-0.2, 1.2))),
         tooltip=[alt.Tooltip("Label:N"), alt.Tooltip("Value:Q")],
     )
-    circles = base.mark_circle(opacity=0.8).encode(
-        size=alt.Size("Value:Q", scale=alt.Scale(range=[300, 6500]), legend=None),
+    circles = base.mark_circle(opacity=0.85).encode(
+        size=alt.Size("Value:Q", scale=alt.Scale(range=[400, 8000]), legend=None),
         color=alt.Color("Label:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
     )
     text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text=alt.Text("Value:Q"))
-    return (circles + text).properties(height=340, title=title)
+    return (circles + text).properties(height=360, title=title)
 
 def bubble_chart_pct(title: str, total_pct: float, ai_pct: float, math_pct: float):
-    """Bubble chart for percent values (0..100)."""
+    """Bubble chart for percent values (0..100). Independent sizing from counts."""
     data = pd.DataFrame({
         "Label": ["Total", "AI Coding", "Math"],
         "Pct": [total_pct, ai_pct, math_pct],
@@ -281,15 +278,16 @@ def bubble_chart_pct(title: str, total_pct: float, ai_pct: float, math_pct: floa
         y=alt.Y("Row:Q", axis=None, scale=alt.Scale(domain=(-0.2, 1.2))),
         tooltip=[
             alt.Tooltip("Label:N"),
-            alt.Tooltip("Pct:Q", title="Conversion %", format=".2f")
+            alt.Tooltip("Pct:Q", title="Conversion %", format=".1f")
         ],
     )
-    circles = base.mark_circle(opacity=0.85).encode(
-        size=alt.Size("Pct:Q", scale=alt.Scale(domain=[0, 100], range=[300, 6500]), legend=None),
+    # Make conversion bubbles larger (independent scale & higher area range)
+    circles = base.mark_circle(opacity=0.9).encode(
+        size=alt.Size("Pct:Q", scale=alt.Scale(domain=[0, 100], range=[1200, 14000]), legend=None),
         color=alt.Color("Label:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
     )
     text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text="PctLabel:N")
-    return (circles + text).properties(height=340, title=title)
+    return (circles + text).properties(height=360, title=title)
 
 # ----------------------------
 # UI
@@ -297,7 +295,7 @@ def bubble_chart_pct(title: str, total_pct: float, ai_pct: float, math_pct: floa
 with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio("Go to", ["MIS"], index=0)
-    st.caption("Use the quick period tabs and filters on the main panel.")
+    st.caption("Use the quick period tabs, filters, or the Custom tab.")
 
 st.title("📊 JetLearn MIS")
 st.markdown(
@@ -311,9 +309,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.write(
-    "Shows **Enrolments (Payments)** at two levels — **MTD (same-month created)** and **Cohort (payments in period)** — "
-    "split by **Pipeline** into **AI-Coding** and **Math**. Below that, the **Conversion%** uses the same logic with "
-    "denominator = **# deals created in the period’s running month**."
+    "Visualizes **Enrolments (Payments)** and **Conversion%** for quick periods and a **Custom** period. "
+    "Conversion% denominator = **# deals created in the period’s running month (anchor)**."
 )
 
 # --- Load data
@@ -343,12 +340,10 @@ this_m_start, this_m_end = month_bounds(today)
 
 # --- Filters UI
 with st.expander("Filters", expanded=True):
-    # Helper to prep options with "All" at top
     def prep_options(series: pd.Series):
         vals = sorted([str(v) for v in series.dropna().unique()])
         return ["All"] + vals
 
-    # Academic Counsellor
     if counsellor_col:
         counsellor_opts = prep_options(df[counsellor_col])
         sel_counsellors = st.multiselect("Academic Counsellor", options=counsellor_opts, default=["All"])
@@ -356,7 +351,6 @@ with st.expander("Filters", expanded=True):
         sel_counsellors = []
         st.info("Academic Counsellor column not found. Skipping this filter.")
 
-    # Country
     if country_col:
         country_opts = prep_options(df[country_col])
         sel_countries = st.multiselect("Country", options=country_opts, default=["All"])
@@ -364,7 +358,6 @@ with st.expander("Filters", expanded=True):
         sel_countries = []
         st.info("Country column not found. Skipping this filter.")
 
-    # JetLearn Deal Source
     if source_col:
         source_opts = prep_options(df[source_col])
         sel_sources = st.multiselect("JetLearn Deal Source", options=source_opts, default=["All"])
@@ -372,20 +365,18 @@ with st.expander("Filters", expanded=True):
         sel_sources = []
         st.info("JetLearn Deal Source column not found. Skipping this filter.")
 
-# --- Apply filters BEFORE calculations
+# Apply filters
 df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellors, sel_countries, sel_sources)
-
-# --- Small header KPI for rows in scope
 st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
 
-# --- Show-all toggle
-show_all = st.checkbox("Show all periods (Yesterday • Today • Last Month • This Month)", value=False, help="Toggle to view all periods together.")
+# Show-all toggle
+show_all = st.checkbox("Show all preset periods (Yesterday • Today • Last Month • This Month)", value=False)
 
 # ----------------------------
 # Period sections (Counts + Conversion%)
 # ----------------------------
 def render_period_block(title: str, range_start: date, range_end: date, running_month_anchor: date):
-    st.markdown(f"#### {title}")
+    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
 
     # Counts
     mtd_counts, coh_counts = prepare_counts_for_range(
@@ -423,22 +414,21 @@ def render_period_block(title: str, range_start: date, range_end: date, running_
             use_container_width=True
         )
 
+# Preset periods
 if view == "MIS":
     if show_all:
-        st.subheader("All Periods")
+        st.subheader("Preset Periods")
         colA, colB = st.columns(2)
-
         with colA:
             render_period_block("Yesterday", yday, yday, yday)
             st.divider()
             render_period_block("Last Month", last_m_start, last_m_end, last_m_start)
-
         with colB:
             render_period_block("Today", today, today, today)
             st.divider()
             render_period_block("This Month", this_m_start, this_m_end, this_m_start)
     else:
-        tabs = st.tabs(["Yesterday", "Today", "Last Month", "This Month"])
+        tabs = st.tabs(["Yesterday", "Today", "Last Month", "This Month", "Custom"])
 
         with tabs[0]:
             render_period_block("Yesterday", yday, yday, yday)
@@ -451,6 +441,26 @@ if view == "MIS":
 
         with tabs[3]:
             render_period_block("This Month", this_m_start, this_m_end, this_m_start)
+
+        # -------- Custom tab --------
+        with tabs[4]:
+            st.markdown("Select a **payments period** and a **running-month anchor** (denominator month).")
+            colc1, colc2 = st.columns(2)
+            with colc1:
+                custom_start = st.date_input("Payments period start", value=this_m_start)
+            with colc2:
+                custom_end = st.date_input("Payments period end (inclusive)", value=this_m_end)
+
+            # Anchor defaults to start date of period,
+            # but the user may override to any date whose month should be the denominator month.
+            default_anchor = custom_start
+            anchor_date = st.date_input("Running-month anchor (denominator month)", value=default_anchor)
+
+            # Safety: ensure start <= end
+            if custom_end < custom_start:
+                st.error("Payments period end cannot be before start.")
+            else:
+                render_period_block("Custom Period", custom_start, custom_end, anchor_date)
 
 # Optional: data preview
 with st.expander("Data preview & column mapping", expanded=False):
