@@ -4,11 +4,8 @@ import numpy as np
 import altair as alt
 from datetime import datetime, date, timedelta
 
-# ----------------------------
-# App Config
-# ----------------------------
 st.set_page_config(
-    page_title="JetLearn MIS – Enrolments (MTD & Cover)",
+    page_title="JetLearn MIS – Enrolments (MTD & Cohort)",
     page_icon="📊",
     layout="wide",
 )
@@ -19,26 +16,21 @@ st.set_page_config(
 @st.cache_data(show_spinner=False)
 def load_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, low_memory=False)
-    # Normalize column names (strip spaces for trailing-space issues)
-    df.columns = [c.strip() for c in df.columns]
+    df.columns = [c.strip() for c in df.columns]  # strip trailing spaces
     return df
 
 def find_col(df: pd.DataFrame, candidates):
-    # Try exact then case-insensitive
     for c in candidates:
         if c in df.columns:
             return c
     low = {c.lower(): c for c in df.columns}
     for c in candidates:
-        lc = c.lower()
-        if lc in low:
-            return low[lc]
+        if c.lower() in low:
+            return low[c.lower()]
     return None
 
 def coerce_datetime(series: pd.Series) -> pd.Series:
-    # Try multiple common formats, defaulting to dayfirst True for EU/IN style
     s = pd.to_datetime(series, errors="coerce", infer_datetime_format=True, dayfirst=True)
-    # If entire column is NaT and there are numeric-like timestamps, try unit='s' then 'ms'
     if s.notna().sum() == 0:
         try:
             s = pd.to_datetime(series, errors="coerce", unit="s")
@@ -57,7 +49,11 @@ def month_bounds(d: date):
         end = date(d.year, d.month + 1, 1) - timedelta(days=1)
     return start, end
 
-# Use Pipeline column explicitly to split AI Coding vs Math
+def last_month_bounds(today: date):
+    first_this = date(today.year, today.month, 1)
+    last_of_prev = first_this - timedelta(days=1)
+    return month_bounds(last_of_prev)
+
 def normalize_pipeline(value: str) -> str:
     if not isinstance(value, str):
         return "Other"
@@ -68,44 +64,48 @@ def normalize_pipeline(value: str) -> str:
         return "AI Coding"
     return "Other"
 
-def prepare_counts(df: pd.DataFrame, month_date: date,
-                   create_col: str, pay_col: str, pipeline_col: str | None):
-
-    m_start, m_end = month_bounds(month_date)
+def prepare_counts_for_range(
+    df: pd.DataFrame,
+    start_d: date,
+    end_d: date,
+    month_for_mtd: date,
+    create_col: str,
+    pay_col: str,
+    pipeline_col: str | None
+):
+    """Returns (mtd_counts, cohort_counts) for a given date range.
+    - cohort_counts: payments with Payment Received Date between start_d and end_d inclusive.
+    - mtd_counts: payments in range AND Create Date in the same calendar month as month_for_mtd.
+    """
     df = df.copy()
-
     df["_create_dt"] = coerce_datetime(df[create_col])
     df["_pay_dt"] = coerce_datetime(df[pay_col])
 
-    # Filter by payment-month
-    in_month_pay = df["_pay_dt"].dt.date.between(m_start, m_end)
+    in_range_pay = df["_pay_dt"].dt.date.between(start_d, end_d)
+    cohort_df = df.loc[in_range_pay]
 
-    # COVER: all payments in month
-    cover_df = df.loc[in_month_pay]
-
-    # MTD: payments in month with create date also in month
+    m_start, m_end = month_bounds(month_for_mtd)
     in_month_create = df["_create_dt"].dt.date.between(m_start, m_end)
-    mtd_df = df.loc[in_month_pay & in_month_create]
+    mtd_df = df.loc[in_range_pay & in_month_create]
 
-    # Pipeline split
     if pipeline_col and pipeline_col in df.columns:
-        cover_split = cover_df[pipeline_col].map(normalize_pipeline).fillna("Other")
+        cohort_split = cohort_df[pipeline_col].map(normalize_pipeline).fillna("Other")
         mtd_split = mtd_df[pipeline_col].map(normalize_pipeline).fillna("Other")
     else:
-        cover_split = pd.Series([], dtype=object)
+        cohort_split = pd.Series([], dtype=object)
         mtd_split = pd.Series([], dtype=object)
 
-    cover_counts = {
-        "Total": int(len(cover_df)),
-        "AI Coding": int((pd.Series(cover_split) == "AI Coding").sum()),
-        "Math": int((pd.Series(cover_split) == "Math").sum()),
+    cohort_counts = {
+        "Total": int(len(cohort_df)),
+        "AI Coding": int((pd.Series(cohort_split) == "AI Coding").sum()),
+        "Math": int((pd.Series(cohort_split) == "Math").sum()),
     }
     mtd_counts = {
         "Total": int(len(mtd_df)),
         "AI Coding": int((pd.Series(mtd_split) == "AI Coding").sum()),
         "Math": int((pd.Series(mtd_split) == "Math").sum()),
     }
-    return mtd_counts, cover_counts
+    return mtd_counts, cohort_counts
 
 def bubble_chart(title: str, total: int, ai_cnt: int, math_cnt: int):
     data = pd.DataFrame({
@@ -133,79 +133,115 @@ def bubble_chart(title: str, total: int, ai_cnt: int, math_cnt: int):
     return (circles + text).properties(height=340, title=title)
 
 # ----------------------------
-# UI – Drawer-ish splash -> MIS
+# UI
 # ----------------------------
 with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio("Go to", ["MIS"], index=0)
-    st.caption("Tip: Use the month selector on the main panel.")
+    st.caption("Use the quick period tabs on the main panel.")
 
 st.title("📊 JetLearn MIS")
 st.write(
-    "This dashboard shows **Enrolments (Payments)** at two levels — "
-    "**MTD (same-month created)** and **Cover (all payments in month)** — "
-    "with a pipeline split across **AI Coding** and **Math** using the **Pipeline** column."
+    "Shows **Enrolments (Payments)** at two levels — **MTD (same-month created)** and **Cohort (payments in period)** — "
+    "split by **Pipeline** into **AI Coding** and **Math**."
 )
 
-default_path = "Master_sheet_DB.csv"  # pre-uploaded in repo
-data_src = st.text_input("Data file path", value=default_path, help="CSV path (kept pre-uploaded in the repo).")
+default_path = "Master_sheet_DB.csv"
+data_src = st.text_input("Data file path", value=default_path, help="CSV path (pre-uploaded in the repo).")
 df = load_data(data_src)
 
-# Resolve critical columns (strip handled; also allow variants)
 create_col = find_col(df, ["Create Date", "Create date", "Create_Date", "Created At"])
 pay_col = find_col(df, ["Payment Received Date", "Payment Received date", "Payment_Received_Date", "Payment Date", "Paid At"])
-pipeline_col = find_col(df, ["Pipeline"])  # explicit
+pipeline_col = find_col(df, ["Pipeline"])
 
 if not create_col or not pay_col:
     st.error("Could not find required date columns. Ensure the CSV has 'Create Date' and 'Payment Received Date' (or close variants).")
     st.stop()
 
-# Month selector (defaults to current month start)
 today = date.today()
-selected_month = st.date_input(
-    "Select month (any day within that month)",
-    value=date(today.year, today.month, 1)
-)
+yday = today - timedelta(days=1)
+last_m_start, last_m_end = last_month_bounds(today)
+this_m_start, this_m_end = month_bounds(today)
 
-# Compute counts
-mtd_counts, cover_counts = prepare_counts(df, selected_month, create_col, pay_col, pipeline_col)
+# Controls for showing all
+show_all = st.checkbox("Show all periods (Yesterday • Today • Last Month • This Month)", value=False, help="Toggle to view all periods together.")
 
 if view == "MIS":
-    st.subheader("MIS – Enrolment Bubbles")
-    c1, c2 = st.columns(2)
+    if show_all:
+        st.subheader("All Periods")
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("#### Yesterday")
+            mtd, coh = prepare_counts_for_range(df, yday, yday, yday, create_col, pay_col, pipeline_col)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.altair_chart(bubble_chart("MTD (Yesterday context)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
+            with c2:
+                st.altair_chart(bubble_chart("Cohort (Yesterday payments)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
 
-    with c1:
-        st.markdown("### MTD (Same-Month Created & Paid)")
-        chart_mtd = bubble_chart(
-            "MTD Enrolments",
-            total=mtd_counts["Total"],
-            ai_cnt=mtd_counts["AI Coding"],
-            math_cnt=mtd_counts["Math"],
-        )
-        st.altair_chart(chart_mtd, use_container_width=True)
+            st.divider()
 
-    with c2:
-        st.markdown("### Cover (All Payments in Month)")
-        chart_cover = bubble_chart(
-            "Cover Enrolments",
-            total=cover_counts["Total"],
-            ai_cnt=cover_counts["AI Coding"],
-            math_cnt=cover_counts["Math"],
-        )
-        st.altair_chart(chart_cover, use_container_width=True)
+            st.markdown("#### Last Month")
+            mtd, coh = prepare_counts_for_range(df, last_m_start, last_m_end, last_m_start, create_col, pay_col, pipeline_col)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.altair_chart(bubble_chart("MTD (Last Month)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
+            with c2:
+                st.altair_chart(bubble_chart("Cohort (Last Month)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
 
-    st.markdown("---")
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    kpi1.metric("MTD – Total", mtd_counts["Total"])
-    kpi2.metric("MTD – AI Coding", mtd_counts["AI Coding"])
-    kpi3.metric("MTD – Math", mtd_counts["Math"])
-    kpi4.metric("Cover – Total", cover_counts["Total"])
+        with colB:
+            st.markdown("#### Today")
+            mtd, coh = prepare_counts_for_range(df, today, today, today, create_col, pay_col, pipeline_col)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.altair_chart(bubble_chart("MTD (Today context)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
+            with c2:
+                st.altair_chart(bubble_chart("Cohort (Today payments)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
 
-    with st.expander("Data preview & column mapping"):
-        st.write("Detected columns:")
-        st.write({
-            "Create Date": create_col,
-            "Payment Received Date": pay_col,
-            "Pipeline (split)": pipeline_col or "Not found → falling back to heuristic",
-        })
-        st.dataframe(df.head(20))
+            st.divider()
+
+            st.markdown("#### This Month")
+            mtd, coh = prepare_counts_for_range(df, this_m_start, this_m_end, this_m_start, create_col, pay_col, pipeline_col)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.altair_chart(bubble_chart("MTD (This Month)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
+            with c2:
+                st.altair_chart(bubble_chart("Cohort (This Month)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
+
+    else:
+        tabs = st.tabs(["Yesterday", "Today", "Last Month", "This Month"])
+        with tabs[0]:
+            st.markdown("### Yesterday")
+            mtd, coh = prepare_counts_for_range(df, yday, yday, yday, create_col, pay_col, pipeline_col)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.altair_chart(bubble_chart("MTD (Yesterday context)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
+            with c2:
+                st.altair_chart(bubble_chart("Cohort (Yesterday payments)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
+
+        with tabs[1]:
+            st.markdown("### Today")
+            mtd, coh = prepare_counts_for_range(df, today, today, today, create_col, pay_col, pipeline_col)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.altair_chart(bubble_chart("MTD (Today context)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
+            with c2:
+                st.altair_chart(bubble_chart("Cohort (Today payments)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
+
+        with tabs[2]:
+            st.markdown("### Last Month")
+            mtd, coh = prepare_counts_for_range(df, last_m_start, last_m_end, last_m_start, create_col, pay_col, pipeline_col)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.altair_chart(bubble_chart("MTD (Last Month)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
+            with c2:
+                st.altair_chart(bubble_chart("Cohort (Last Month)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
+
+        with tabs[3]:
+            st.markdown("### This Month")
+            mtd, coh = prepare_counts_for_range(df, this_m_start, this_m_end, this_m_start, create_col, pay_col, pipeline_col)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.altair_chart(bubble_chart("MTD (This Month)", mtd["Total"], mtd["AI Coding"], mtd["Math"]), use_container_width=True)
+            with c2:
+                st.altair_chart(bubble_chart("Cohort (This Month)", coh["Total"], coh["AI Coding"], coh["Math"]), use_container_width=True)
