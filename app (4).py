@@ -178,17 +178,17 @@ def prepare_counts_for_range(
     }
     return mtd_counts, cohort_counts
 
-# ---------- CONVERSION% LOGIC ----------
-def deals_created_in_anchor_month(df: pd.DataFrame, running_month_any_date: date, create_col: str) -> int:
-    df = df.copy()
-    df["_create_dt"] = coerce_datetime(df[create_col])
+# ---------- CONVERSION% LOGIC (per-pipeline denominators) ----------
+def deals_created_mask_anchor(df: pd.DataFrame, running_month_any_date: date, create_col: str) -> pd.Series:
+    d = df.copy()
+    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
     m_start, m_end = month_bounds(running_month_any_date)
-    return int(df["_create_dt"].dt.date.between(m_start, m_end).sum())
+    return d["_create_dt"].between(m_start, m_end)
 
-def deals_created_in_range(df: pd.DataFrame, denom_start: date, denom_end: date, create_col: str) -> int:
-    df = df.copy()
-    df["_create_dt"] = coerce_datetime(df[create_col])
-    return int(df["_create_dt"].dt.date.between(denom_start, denom_end).sum())
+def deals_created_mask_range(df: pd.DataFrame, denom_start: date, denom_end: date, create_col: str) -> pd.Series:
+    d = df.copy()
+    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
+    return d["_create_dt"].between(denom_start, denom_end)
 
 def prepare_conversion_for_range(
     df: pd.DataFrame,
@@ -203,51 +203,82 @@ def prepare_conversion_for_range(
     denom_start: date | None = None,             # required if denom_mode="range"
     denom_end: date | None = None
 ):
-    """Returns (mtd_pct, coh_pct, denom, numerators)"""
-    df = df.copy()
-    df["_create_dt"] = coerce_datetime(df[create_col])
-    df["_pay_dt"] = coerce_datetime(df[pay_col])
+    """
+    Returns:
+      mtd_pct, coh_pct, denoms, numerators
+      where each is a dict with keys: "Total", "AI Coding", "Math"
 
-    # Denominator
+    - Denominators are computed PER PIPELINE:
+        Total = all deals created in denom period
+        AI Coding = AI deals created in denom period
+        Math = Math deals created in denom period
+    - MTD numerator:
+        payments in [start_d,end_d] AND created within denom period (per-pipeline)
+    - Cohort numerator:
+        payments in [start_d,end_d] (per pipeline)
+    """
+    d = df.copy()
+    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
+    d["_pay_dt"] = coerce_datetime(d[pay_col]).dt.date
+
     if denom_mode == "range":
         if denom_start is None or denom_end is None:
-            return {"Total":0.0,"AI Coding":0.0,"Math":0.0}, {"Total":0.0,"AI Coding":0.0,"Math":0.0}, 0, {"mtd":{}, "cohort":{}}
-        denom = deals_created_in_range(df, denom_start, denom_end, create_col)
-        in_mtd_create = df["_create_dt"].dt.date.between(denom_start, denom_end)
+            zero = {"Total":0.0,"AI Coding":0.0,"Math":0.0}
+            return zero, zero, {"Total":0,"AI Coding":0,"Math":0}, {"mtd": {}, "cohort": {}}
+        denom_mask = deals_created_mask_range(d, denom_start, denom_end, create_col)
     else:
         if running_month_anchor is None:
-            return {"Total":0.0,"AI Coding":0.0,"Math":0.0}, {"Total":0.0,"AI Coding":0.0,"Math":0.0}, 0, {"mtd":{}, "cohort":{}}
-        denom = deals_created_in_anchor_month(df, running_month_anchor, create_col)
-        m_start, m_end = month_bounds(running_month_anchor)
-        in_mtd_create = df["_create_dt"].dt.date.between(m_start, m_end)
+            zero = {"Total":0.0,"AI Coding":0.0,"Math":0.0}
+            return zero, zero, {"Total":0,"AI Coding":0,"Math":0}, {"mtd": {}, "cohort": {}}
+        denom_mask = deals_created_mask_anchor(d, running_month_anchor, create_col)
+
+    # pipeline series
+    if pipeline_col and pipeline_col in d.columns:
+        pl = d[pipeline_col].map(normalize_pipeline).fillna("Other")
+    else:
+        pl = pd.Series(["Other"] * len(d), index=d.index)
+
+    # Denoms per series
+    den_total = int(denom_mask.sum())
+    den_ai    = int((denom_mask & (pl == "AI Coding")).sum())
+    den_math  = int((denom_mask & (pl == "Math")).sum())
+    denoms = {"Total": den_total, "AI Coding": den_ai, "Math": den_math}
 
     # Numerators
-    in_range_pay = df["_pay_dt"].dt.date.between(start_d, end_d)
-    mtd_df = df.loc[in_range_pay & in_mtd_create]
-    cohort_df = df.loc[in_range_pay]
+    pay_mask = d["_pay_dt"].between(start_d, end_d)
 
-    if pipeline_col and pipeline_col in df.columns:
-        mtd_ai = int((mtd_df[pipeline_col].map(normalize_pipeline).fillna("Other") == "AI Coding").sum())
-        mtd_math = int((mtd_df[pipeline_col].map(normalize_pipeline).fillna("Other") == "Math").sum())
-        coh_ai = int((cohort_df[pipeline_col].map(normalize_pipeline).fillna("Other") == "AI Coding").sum())
-        coh_math = int((cohort_df[pipeline_col].map(normalize_pipeline).fillna("Other") == "Math").sum())
-    else:
-        mtd_ai = mtd_math = coh_ai = coh_math = 0
+    # MTD: pay in window AND created in denom
+    mtd_mask = pay_mask & denom_mask
+    mtd_total = int(mtd_mask.sum())
+    mtd_ai    = int((mtd_mask & (pl == "AI Coding")).sum())
+    mtd_math  = int((mtd_mask & (pl == "Math")).sum())
 
-    mtd_total = int(len(mtd_df))
-    coh_total = int(len(cohort_df))
+    # Cohort: pay in window (any create)
+    coh_mask = pay_mask
+    coh_total = int(coh_mask.sum())
+    coh_ai    = int((coh_mask & (pl == "AI Coding")).sum())
+    coh_math  = int((coh_mask & (pl == "Math")).sum())
 
-    cap = lambda x: max(0.0, min(100.0, x))
-    pct1 = lambda v, d: 0.0 if d == 0 else cap(round(100.0 * v / d, 1))
+    def pct(n, d):
+        if d == 0:
+            return 0.0
+        return max(0.0, min(100.0, round(100.0 * n / d, 1)))
 
-    mtd_pct = {"Total": pct1(mtd_total, denom), "AI Coding": pct1(mtd_ai, denom), "Math": pct1(mtd_math, denom)}
-    coh_pct = {"Total": pct1(coh_total, denom), "AI Coding": pct1(coh_ai, denom), "Math": pct1(coh_math, denom)}
-
+    mtd_pct = {
+        "Total": pct(mtd_total, den_total),
+        "AI Coding": pct(mtd_ai, den_ai),
+        "Math": pct(mtd_math, den_math),
+    }
+    coh_pct = {
+        "Total": pct(coh_total, den_total),
+        "AI Coding": pct(coh_ai, den_ai),
+        "Math": pct(coh_math, den_math),
+    }
     numerators = {
         "mtd": {"Total": mtd_total, "AI Coding": mtd_ai, "Math": mtd_math},
         "cohort": {"Total": coh_total, "AI Coding": coh_ai, "Math": coh_math},
     }
-    return mtd_pct, coh_pct, denom, numerators
+    return mtd_pct, coh_pct, denoms, numerators
 
 # ---------- BULLET GAUGE (professional horizontal) ----------
 def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, denominator: int,
@@ -293,7 +324,7 @@ def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, 
         ],
     )
 
-    needle = alt.Chart(pd.DataFrame({"val":[p], "title":[title]})).mark_rule(strokeWidth=2).encode(
+    needle = alt.Chart(pd.DataFrame({"val":[p]})).mark_rule(strokeWidth=2).encode(
         x=alt.X("val:Q", scale=alt.Scale(domain=[0,100])),
         color=alt.value("#111827"),
     )
@@ -302,7 +333,7 @@ def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, 
         align="left", baseline="middle", dx=-6, color="#374151", fontSize=12
     ).encode(
         text="t:N"
-    ).properties(width=0)  # just used in hconcat
+    ).properties(width=0)  # spacer
 
     label_right = alt.Chart(pd.DataFrame({"p":[f"{p:.1f}%"]})).mark_text(
         align="left", baseline="middle", dx=8, color="#111827", fontSize=12, fontWeight="bold"
@@ -310,31 +341,30 @@ def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, 
         text="p:N"
     ).properties(width=0)
 
-    # Compose: [left label] [gauge] [right % label]
     gauge = alt.hconcat(label_left, (base + value_bar + needle), label_right).resolve_scale(x="shared")
     return gauge
 
-def bullet_group(title: str, pcts: dict, nums: dict, denom: int):
+def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict):
     st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
 
-    # KPI chips above gauges
+    # KPI chips above gauges (each shows its own denominator)
     c1, c2, c3 = st.columns(3)
     with c1:
         st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Total</div>"
                     f"<div class='kpi-value'>{pcts['Total']:.1f}%</div>"
-                    f"<div class='kpi-sub'>Den: {denom:,} • Num: {nums.get('Total',0):,}</div></div>", unsafe_allow_html=True)
+                    f"<div class='kpi-sub'>Den: {denoms.get('Total',0):,} • Num: {nums.get('Total',0):,}</div></div>", unsafe_allow_html=True)
     with c2:
         st.markdown(f"<div class='kpi-card'><div class='kpi-title'>AI-Coding</div>"
                     f"<div class='kpi-value' style='color:{PALETTE['AI Coding']}'>{pcts['AI Coding']:.1f}%</div>"
-                    f"<div class='kpi-sub'>Den: {denom:,} • Num: {nums.get('AI Coding',0):,}</div></div>", unsafe_allow_html=True)
+                    f"<div class='kpi-sub'>Den: {denoms.get('AI Coding',0):,} • Num: {nums.get('AI Coding',0):,}</div></div>", unsafe_allow_html=True)
     with c3:
         st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Math</div>"
                     f"<div class='kpi-value' style='color:{PALETTE['Math']}'>{pcts['Math']:.1f}%</div>"
-                    f"<div class='kpi-sub'>Den: {denom:,} • Num: {nums.get('Math',0):,}</div></div>", unsafe_allow_html=True)
+                    f"<div class='kpi-sub'>Den: {denoms.get('Math',0):,} • Num: {nums.get('Math',0):,}</div></div>", unsafe_allow_html=True)
 
-    g1 = bullet_gauge(pcts["Total"], "Total", PALETTE["Total"], nums.get("Total",0), denom)
-    g2 = bullet_gauge(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums.get("AI Coding",0), denom)
-    g3 = bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], nums.get("Math",0), denom)
+    g1 = bullet_gauge(pcts["Total"], "Total", PALETTE["Total"], nums.get("Total",0), denoms.get("Total",0))
+    g2 = bullet_gauge(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums.get("AI Coding",0), denoms.get("AI Coding",0))
+    g3 = bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], nums.get("Math",0), denoms.get("Math",0))
 
     st.altair_chart(g1, use_container_width=True)
     st.altair_chart(g2, use_container_width=True)
@@ -465,8 +495,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.write(
-    "Visualizes **Enrolments (Payments)**, **Conversion%** (bullet gauges), and **Trend** (Leads vs Enrolments). "
-    "Conversion% uses a **single shared denominator** for Total/AI/Math."
+    "Visualizes **Enrolments (Payments)**, **Conversion%** (per-pipeline denominators), and **Trend**. "
+    "Conversion% can use an **anchor month** or a **custom date range** as denominator."
 )
 
 # --- Load data
@@ -551,14 +581,16 @@ def render_period_block(title: str, range_start: date, range_end: date, running_
             use_container_width=True
         )
 
-    # Conversion% (shared denominator) → Bullet gauges
-    mtd_pct, coh_pct, denom, nums = prepare_conversion_for_range(
+    # Conversion% (per-pipeline denominators) → Bullet gauges
+    mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
         df_f, range_start, range_end, create_col, pay_col, pipeline_col,
         denom_mode="anchor", running_month_anchor=running_month_anchor
     )
-    st.caption(f"Conversion% denominator (deals created in running month): **{denom:,}**")
-    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denom)
-    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denom)
+    st.caption(
+        f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}"
+    )
+    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
+    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
 
     # Trend (combined)
     ts = trend_timeseries(
@@ -619,16 +651,18 @@ if view == "MIS":
                     with c2:
                         st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
 
-                    # Conversion → bullet gauges (anchor)
-                    mtd_pct, coh_pct, denom, nums = prepare_conversion_for_range(
+                    # Conversion → bullet gauges (per-pipeline denoms)
+                    mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
                         df_f, custom_start, custom_end, create_col, pay_col, pipeline_col,
                         denom_mode="anchor", running_month_anchor=anchor
                     )
-                    st.caption(f"Conversion% denominator (deals created in anchor month): **{denom:,}**")
-                    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denom)
-                    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denom)
+                    st.caption(
+                        f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}"
+                    )
+                    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
+                    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
 
-                    # Trend using anchor denom
+                    # Trend using anchor denom (visual only)
                     ts = trend_timeseries(
                         df_f, custom_start, custom_end,
                         denom_mode="anchor", running_month_anchor=anchor,
@@ -655,16 +689,18 @@ if view == "MIS":
                         with c2:
                             st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
 
-                        # Conversion → bullet gauges (custom range denom)
-                        mtd_pct, coh_pct, denom, nums = prepare_conversion_for_range(
+                        # Conversion → bullet gauges (per-pipeline denoms in custom range)
+                        mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
                             df_f, custom_start, custom_end, create_col, pay_col, pipeline_col,
                             denom_mode="range", denom_start=denom_start, denom_end=denom_end
                         )
-                        st.caption(f"Conversion% denominator (deals created in custom range): **{denom:,}**")
-                        bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denom)
-                        bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denom)
+                        st.caption(
+                            f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}"
+                        )
+                        bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
+                        bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
 
-                        # Trend using custom denom range
+                        # Trend using custom denom range (visual only)
                         ts = trend_timeseries(
                             df_f, custom_start, custom_end,
                             denom_mode="range", denom_start=denom_start, denom_end=denom_end,
