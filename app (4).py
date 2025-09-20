@@ -34,6 +34,16 @@ st.markdown(
       .pill-total { background: #e5e7eb; }
       .pill-ai    { background: #bfdbfe; }
       .pill-math  { background: #bbf7d0; }
+
+      .kpi-card {
+        border: 1px solid #e5e7eb;
+        border-radius: 14px;
+        padding: 12px 14px;
+        background: #fafafa;
+      }
+      .kpi-title { color:#6b7280; font-size:.9rem; margin-bottom:6px; }
+      .kpi-value { font-weight:700; font-size:1.4rem; color:#111827; }
+      .kpi-sub   { color:#6b7280; font-size:.85rem; }
       .section-title {
         font-weight: 700;
         font-size: 1.05rem;
@@ -50,6 +60,9 @@ PALETTE = {
     "Total": "#6b7280",      # gray-500
     "AI Coding": "#2563eb",  # blue-600
     "Math": "#16a34a",       # green-600
+    "ThresholdLow": "#f3f4f6",   # gray-100
+    "ThresholdMid": "#e5e7eb",   # gray-200
+    "ThresholdHigh": "#d1d5db",  # gray-300
 }
 
 # ----------------------------
@@ -116,15 +129,12 @@ def apply_filters(
     sel_sources: list[str],
 ) -> pd.DataFrame:
     f = df.copy()
-    if counsellor_col and len(sel_counsellors) > 0:
-        if "All" not in sel_counsellors:
-            f = f[f[counsellor_col].astype(str).isin(sel_counsellors)]
-    if country_col and len(sel_countries) > 0:
-        if "All" not in sel_countries:
-            f = f[f[country_col].astype(str).isin(sel_countries)]
-    if source_col and len(sel_sources) > 0:
-        if "All" not in sel_sources:
-            f = f[f[source_col].astype(str).isin(sel_sources)]
+    if counsellor_col and len(sel_counsellors) > 0 and "All" not in sel_counsellors:
+        f = f[f[counsellor_col].astype(str).isin(sel_counsellors)]
+    if country_col and len(sel_countries) > 0 and "All" not in sel_countries:
+        f = f[f[country_col].astype(str).isin(sel_countries)]
+    if source_col and len(sel_sources) > 0 and "All" not in sel_sources:
+        f = f[f[source_col].astype(str).isin(sel_sources)]
     return f
 
 # ---------- COUNT LOGIC ----------
@@ -137,10 +147,7 @@ def prepare_counts_for_range(
     pay_col: str,
     pipeline_col: str | None
 ):
-    """(mtd_counts, cohort_counts) where:
-       - Cohort: payments with pay date in [start_d, end_d]
-       - MTD: payments in [start_d, end_d] AND create date in same month as month_for_mtd
-    """
+    """(mtd_counts, cohort_counts)"""
     df = df.copy()
     df["_create_dt"] = coerce_datetime(df[create_col])
     df["_pay_dt"] = coerce_datetime(df[pay_col])
@@ -196,9 +203,7 @@ def prepare_conversion_for_range(
     denom_start: date | None = None,             # required if denom_mode="range"
     denom_end: date | None = None
 ):
-    """
-    Returns (mtd_pct, coh_pct, denom, numerators)
-    """
+    """Returns (mtd_pct, coh_pct, denom, numerators)"""
     df = df.copy()
     df["_create_dt"] = coerce_datetime(df[create_col])
     df["_pay_dt"] = coerce_datetime(df[pay_col])
@@ -244,52 +249,96 @@ def prepare_conversion_for_range(
     }
     return mtd_pct, coh_pct, denom, numerators
 
-# ---------- GAUGE (semi-donut) ----------
-def gauge_chart(percent: float, title: str, color_hex: str, numerator: int, denominator: int):
+# ---------- BULLET GAUGE (professional horizontal) ----------
+def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, denominator: int,
+                 thresholds=(10, 20)):
     """
-    Semi-donut using theta with angle range [-π, 0] (no startAngle/endAngle encodings).
+    Professional horizontal gauge with thresholds:
+      - Background bands: [0, low], (low, mid], (mid, 100]
+      - Foreground bar: 0 → percent (series color)
+      - Thin marker (needle) at percent
     """
-    p = max(0.0, min(100.0, float(percent)))
-    data = pd.DataFrame({
-        "part": ["value", "rest"],
-        "val":  [p, 100 - p],
-        "series": [title, title],
-        "num": [numerator, numerator],
-        "den": [denominator, denominator],
-        "percent": [f"{p:.1f}%", f"{p:.1f}%"],
-    })
+    p = float(max(0.0, min(100.0, percent)))
+    low, mid = thresholds
 
-    base = alt.Chart(data).mark_arc(innerRadius=70, outerRadius=110).encode(
-        theta=alt.Theta("val:Q", stack=True, scale=alt.Scale(domain=[0, 100], range=[-math.pi, 0])),
-        color=alt.Color("part:N", scale=alt.Scale(domain=["value", "rest"], range=[color_hex, "#e5e7eb"]), legend=None),
+    # Background bands
+    bg = pd.DataFrame([
+        {"band": "low",  "start": 0,   "end": low, "color": PALETTE["ThresholdLow"]},
+        {"band": "mid",  "start": low, "end": mid, "color": PALETTE["ThresholdMid"]},
+        {"band": "high", "start": mid, "end": 100, "color": PALETTE["ThresholdHigh"]},
+    ])
+
+    # Foreground (value)
+    fg = pd.DataFrame([{"start": 0, "end": p, "title": title,
+                        "percent": f"{p:.1f}%", "num": numerator, "den": denominator}])
+
+    base = alt.Chart(bg).mark_bar(height=18).encode(
+        x=alt.X("start:Q", axis=None, scale=alt.Scale(domain=[0,100])),
+        x2="end:Q",
+        color=alt.Color("band:N", scale=alt.Scale(
+            domain=["low","mid","high"],
+            range=[PALETTE["ThresholdLow"], PALETTE["ThresholdMid"], PALETTE["ThresholdHigh"]]),
+            legend=None),
+    ).properties(height=32, width=360)
+
+    value_bar = alt.Chart(fg).mark_bar(height=18, cornerRadius=4).encode(
+        x=alt.X("start:Q", axis=None, scale=alt.Scale(domain=[0,100])),
+        x2="end:Q",
+        color=alt.value(series_color),
         tooltip=[
-            alt.Tooltip("series:N", title="Series"),
-            alt.Tooltip("part:N", title="Slice"),
+            alt.Tooltip("title:N", title="Series"),
+            alt.Tooltip("percent:N", title="Conversion %"),
             alt.Tooltip("num:Q", title="Numerator"),
             alt.Tooltip("den:Q", title="Denominator"),
-            alt.Tooltip("percent:N", title="Conversion %"),
         ],
-    ).properties(width=240, height=150)
+    )
 
-    label_pct = alt.Chart(pd.DataFrame({"t":[f"{p:.1f}%"]})).mark_text(
-        fontWeight="bold", fontSize=20, color="#111827"
-    ).encode(text="t:N").properties(width=240, height=150)
+    needle = alt.Chart(pd.DataFrame({"val":[p], "title":[title]})).mark_rule(strokeWidth=2).encode(
+        x=alt.X("val:Q", scale=alt.Scale(domain=[0,100])),
+        color=alt.value("#111827"),
+    )
 
-    label_title = alt.Chart(pd.DataFrame({"t":[title]})).mark_text(
-        dy=28, fontSize=13, color="#374151"
-    ).encode(text="t:N").properties(width=240, height=150)
+    label_left = alt.Chart(pd.DataFrame({"t":[title]})).mark_text(
+        align="left", baseline="middle", dx=-6, color="#374151", fontSize=12
+    ).encode(
+        text="t:N"
+    ).properties(width=0)  # just used in hconcat
 
-    return base + label_pct + label_title
+    label_right = alt.Chart(pd.DataFrame({"p":[f"{p:.1f}%"]})).mark_text(
+        align="left", baseline="middle", dx=8, color="#111827", fontSize=12, fontWeight="bold"
+    ).encode(
+        text="p:N"
+    ).properties(width=0)
 
-def gauge_row(title_left: str, pcts: dict, nums: dict, denom: int):
-    st.markdown(f"<div class='section-title'>{title_left}</div>", unsafe_allow_html=True)
-    colA, colB, colC = st.columns(3)
-    with colA:
-        st.altair_chart(gauge_chart(pcts["Total"], "Total", PALETTE["Total"], nums["Total"], denom), use_container_width=True)
-    with colB:
-        st.altair_chart(gauge_chart(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums["AI Coding"], denom), use_container_width=True)
-    with colC:
-        st.altair_chart(gauge_chart(pcts["Math"], "Math", PALETTE["Math"], nums["Math"], denom), use_container_width=True)
+    # Compose: [left label] [gauge] [right % label]
+    gauge = alt.hconcat(label_left, (base + value_bar + needle), label_right).resolve_scale(x="shared")
+    return gauge
+
+def bullet_group(title: str, pcts: dict, nums: dict, denom: int):
+    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
+
+    # KPI chips above gauges
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Total</div>"
+                    f"<div class='kpi-value'>{pcts['Total']:.1f}%</div>"
+                    f"<div class='kpi-sub'>Den: {denom:,} • Num: {nums.get('Total',0):,}</div></div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>AI-Coding</div>"
+                    f"<div class='kpi-value' style='color:{PALETTE['AI Coding']}'>{pcts['AI Coding']:.1f}%</div>"
+                    f"<div class='kpi-sub'>Den: {denom:,} • Num: {nums.get('AI Coding',0):,}</div></div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Math</div>"
+                    f"<div class='kpi-value' style='color:{PALETTE['Math']}'>{pcts['Math']:.1f}%</div>"
+                    f"<div class='kpi-sub'>Den: {denom:,} • Num: {nums.get('Math',0):,}</div></div>", unsafe_allow_html=True)
+
+    g1 = bullet_gauge(pcts["Total"], "Total", PALETTE["Total"], nums.get("Total",0), denom)
+    g2 = bullet_gauge(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums.get("AI Coding",0), denom)
+    g3 = bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], nums.get("Math",0), denom)
+
+    st.altair_chart(g1, use_container_width=True)
+    st.altair_chart(g2, use_container_width=True)
+    st.altair_chart(g3, use_container_width=True)
 
 # ---------- BUBBLES FOR COUNTS ----------
 def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
@@ -323,8 +372,8 @@ def trend_timeseries(
     running_month_anchor: date | None = None,
     denom_start: date | None = None,
     denom_end: date | None = None,
-    create_col: str = "Create Date",
-    pay_col: str = "Payment Received Date"
+    create_col: str,
+    pay_col: str
 ):
     df = df.copy()
     df["_create_dt"] = coerce_datetime(df[create_col]).dt.date
@@ -416,8 +465,8 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.write(
-    "Visualizes **Enrolments (Payments)**, **Conversion% gauges**, and **Trend** (Leads vs Enrolments). "
-    "Conversion% denominator can be the **anchor month** or a **custom date range**."
+    "Visualizes **Enrolments (Payments)**, **Conversion%** (bullet gauges), and **Trend** (Leads vs Enrolments). "
+    "Conversion% uses a **single shared denominator** for Total/AI/Math."
 )
 
 # --- Load data
@@ -502,14 +551,14 @@ def render_period_block(title: str, range_start: date, range_end: date, running_
             use_container_width=True
         )
 
-    # Conversion% → Gauges
+    # Conversion% (shared denominator) → Bullet gauges
     mtd_pct, coh_pct, denom, nums = prepare_conversion_for_range(
         df_f, range_start, range_end, create_col, pay_col, pipeline_col,
         denom_mode="anchor", running_month_anchor=running_month_anchor
     )
     st.caption(f"Conversion% denominator (deals created in running month): **{denom:,}**")
-    gauge_row("MTD Conversion %", mtd_pct, nums["mtd"], denom)
-    gauge_row("Cohort Conversion %", coh_pct, nums["cohort"], denom)
+    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denom)
+    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denom)
 
     # Trend (combined)
     ts = trend_timeseries(
@@ -570,14 +619,14 @@ if view == "MIS":
                     with c2:
                         st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
 
-                    # Conversion → gauges (anchor)
+                    # Conversion → bullet gauges (anchor)
                     mtd_pct, coh_pct, denom, nums = prepare_conversion_for_range(
                         df_f, custom_start, custom_end, create_col, pay_col, pipeline_col,
                         denom_mode="anchor", running_month_anchor=anchor
                     )
                     st.caption(f"Conversion% denominator (deals created in anchor month): **{denom:,}**")
-                    gauge_row("MTD Conversion %", mtd_pct, nums["mtd"], denom)
-                    gauge_row("Cohort Conversion %", coh_pct, nums["cohort"], denom)
+                    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denom)
+                    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denom)
 
                     # Trend using anchor denom
                     ts = trend_timeseries(
@@ -606,14 +655,14 @@ if view == "MIS":
                         with c2:
                             st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
 
-                        # Conversion → gauges (custom range denom)
+                        # Conversion → bullet gauges (custom range denom)
                         mtd_pct, coh_pct, denom, nums = prepare_conversion_for_range(
                             df_f, custom_start, custom_end, create_col, pay_col, pipeline_col,
                             denom_mode="range", denom_start=denom_start, denom_end=denom_end
                         )
                         st.caption(f"Conversion% denominator (deals created in custom range): **{denom:,}**")
-                        gauge_row("MTD Conversion %", mtd_pct, nums["mtd"], denom)
-                        gauge_row("Cohort Conversion %", coh_pct, nums["cohort"], denom)
+                        bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denom)
+                        bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denom)
 
                         # Trend using custom denom range
                         ts = trend_timeseries(
