@@ -667,8 +667,7 @@ def accuracy_scatter(bt: pd.DataFrame):
         y=alt.Y("Forecast:Q", title="Forecast (start-of-month)"),
         tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Actual:Q"), alt.Tooltip("Forecast:Q"), alt.Tooltip("Error:Q")],
     ).properties(height=360, title="Forecast vs Actual (by month)")
-    line = alt.Chart(pd.DataFrame({"x":[bt["Actual"].min(), bt["Actual"].max()],
-                                   "y":[bt["Actual"].min(), bt["Actual"].max()]})).mark_line()
+    line = alt.Chart(pd.DataFrame({"x":[bt["Actual"].min(), bt["Actual"].max()],"y":[bt["Actual"].min(), bt["Actual"].max()]})).mark_line()
     return chart + line
 
 # ----------------------------
@@ -878,10 +877,12 @@ if view == "Predictibility":
     with colp1:
         lookback = st.selectbox("Lookback window (months)", [3, 6, 12], index=0)
     with colp2:
-        weighting = st.radio("Averaging", ["Recency-weighted", "Simple average"], index=0, horizontal=False)
-        weighted = (weighting == "Recency-weighted")
+        # Fixed to Recency-weighted (simple average removed)
+        st.markdown("**Averaging:** Recency-weighted")
+        st.caption("Uses weights 1..K across the last K pay-months (most recent has highest weight).")
+        weighted = True
     with colp3:
-        st.info("Daily rates are computed per source from the last K pay-months (excluding current). Recency weighting uses 1..K.")
+        st.info("Daily rates are computed per source from the last K pay-months (excluding current).")
 
     # Payments in current month (after filters)
     cur_start, cur_end = month_bounds(today)
@@ -927,7 +928,7 @@ if view == "Predictibility":
     bt, metrics = backtest_accuracy(
         df_f, create_col, pay_col, source_col,
         lookback=lookback, weighted=weighted,
-        backtest_months=lookback,  # <— tie accuracy window to lookback
+        backtest_months=lookback,  # tie accuracy window to lookback
         today=today
     )
 
