@@ -111,6 +111,10 @@ def last_month_bounds(today: date):
     last_of_prev = first_this - timedelta(days=1)
     return month_bounds(last_of_prev)
 
+def month_days(period: pd.Period) -> int:
+    y, m = period.year, period.month
+    return monthrange(y, m)[1]
+
 def normalize_pipeline(value: str) -> str:
     if not isinstance(value, str):
         return "Other"
@@ -140,7 +144,6 @@ def apply_filters(
     return f
 
 # ---------- Always-on exclusion for Invalid Deals ----------
-import re
 INVALID_RE = re.compile(r"^\s*1\.2\s*invalid\s*deal[s]?\s*$", flags=re.IGNORECASE)
 
 def exclude_invalid_deals(df: pd.DataFrame, dealstage_col: str | None) -> tuple[pd.DataFrame, int]:
@@ -151,7 +154,7 @@ def exclude_invalid_deals(df: pd.DataFrame, dealstage_col: str | None) -> tuple[
     removed = int((~mask_keep).sum())
     return df.loc[mask_keep].copy(), removed
 
-# ---------- COUNT LOGIC (MIS) ----------
+# ---------- MIS logic ----------
 def prepare_counts_for_range(
     df: pd.DataFrame,
     start_d: date,
@@ -191,7 +194,6 @@ def prepare_counts_for_range(
     }
     return mtd_counts, cohort_counts
 
-# ---------- CONVERSION% LOGIC (MIS) ----------
 def deals_created_mask_anchor(df: pd.DataFrame, running_month_any_date: date, create_col: str) -> pd.Series:
     d = df.copy()
     d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
@@ -312,26 +314,6 @@ def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, 
 
     return alt.hconcat(label_left, (base + value_bar + needle), label_right).resolve_scale(x="shared")
 
-def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict):
-    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Total</div>"
-                    f"<div class='kpi-value'>{pcts['Total']:.1f}%</div>"
-                    f"<div class='kpi-sub'>Den: {denoms.get('Total',0):,} • Num: {nums.get('Total',0):,}</div></div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>AI-Coding</div>"
-                    f"<div class='kpi-value' style='color:{PALETTE['AI Coding']}'>{pcts['AI Coding']:.1f}%</div>"
-                    f"<div class='kpi-sub'>Den: {denoms.get('AI Coding',0):,} • Num: {nums.get('AI Coding',0):,}</div></div>", unsafe_allow_html=True)
-    with c3:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Math</div>"
-                    f"<div class='kpi-value' style='color:{PALETTE['Math']}'>{pcts['Math']:.1f}%</div>"
-                    f"<div class='kpi-sub'>Den: {denoms.get('Math',0):,} • Num: {nums.get('Math',0):,}</div></div>", unsafe_allow_html=True)
-
-    st.altair_chart(bullet_gauge(pcts["Total"], "Total", PALETTE["Total"], nums.get("Total",0), denoms.get("Total",0)), use_container_width=True)
-    st.altair_chart(bullet_gauge(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums.get("AI Coding",0), denoms.get("AI Coding",0)), use_container_width=True)
-    st.altair_chart(bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], nums.get("Math",0), denoms.get("Math",0)), use_container_width=True)
-
 def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
     data = pd.DataFrame({
         "Label": ["Total", "AI Coding", "Math"],
@@ -436,7 +418,7 @@ def trend_chart(ts: pd.DataFrame, title: str):
     return alt.layer(bars, line_mtd, line_coh).resolve_scale(y='independent').properties(title=title)
 
 # ----------------------------
-# PREDICTIBILITY core (A/B/C via lookback daily rates)
+# Predictibility core (A/B/C via lookback daily rates) + Accuracy
 # ----------------------------
 def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFrame:
     d = df.copy()
@@ -447,12 +429,7 @@ def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFr
     d["_same_month"] = (d["_create_m"] == d["_pay_m"])
     return d
 
-def month_days(period: pd.Period) -> int:
-    y, m = period.year, period.month
-    return monthrange(y, m)[1]
-
 def per_source_monthly_counts(d_hist: pd.DataFrame, source_col: str):
-    """Return frame with per-month, per-source counts split by same vs prev."""
     if d_hist.empty:
         return pd.DataFrame(columns=["_pay_m", source_col, "cnt_same", "cnt_prev", "days_in_month"])
     g = d_hist.groupby(["_pay_m", source_col])
@@ -464,11 +441,6 @@ def per_source_monthly_counts(d_hist: pd.DataFrame, source_col: str):
     return by
 
 def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: int, weighted: bool):
-    """
-    Compute per-source daily rates for same-month and prev-month payments from the last `lookback` pay-months.
-    Weighted by month recency if `weighted=True` (1..k).
-    Also returns overall fallback rates.
-    """
     if d_hist.empty:
         return {}, {}, 0.0, 0.0
 
@@ -478,28 +450,27 @@ def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: i
 
     by = per_source_monthly_counts(d_hist, source_col)
 
-    # Weights per month
     month_to_w = {m: (i+1 if weighted else 1.0) for i, m in enumerate(sorted(months))}
 
-    # Per-source weighted daily rates
     rates_same, rates_prev = {}, {}
     for src, sub in by.groupby(source_col):
-        num_same = (sub["cnt_same"] / sub["days_in_month"] * sub["_pay_m"].map(month_to_w)).sum()
-        den_same = sub["_pay_m"].map(month_to_w).sum()
-        num_prev = (sub["cnt_prev"] / sub["days_in_month"] * sub["_pay_m"].map(month_to_w)).sum()
-        den_prev = den_same
-        rates_same[str(src)] = float(num_same/den_same) if den_same > 0 else 0.0
-        rates_prev[str(src)] = float(num_prev/den_prev) if den_prev > 0 else 0.0
+        w = sub["_pay_m"].map(month_to_w)
+        num_same = (sub["cnt_same"] / sub["days_in_month"] * w).sum()
+        num_prev = (sub["cnt_prev"] / sub["days_in_month"] * w).sum()
+        den = w.sum()
+        rates_same[str(src)] = float(num_same/den) if den > 0 else 0.0
+        rates_prev[str(src)] = float(num_prev/den) if den > 0 else 0.0
 
-    # Overall fallback (all sources combined)
+    # Overall fallback
     by_overall = d_hist.groupby("_pay_m")["_same_month"].agg(
         cnt_same=lambda s: int(s.sum()),
         cnt_prev=lambda s: int((~s).sum())
     ).reset_index()
     by_overall["days_in_month"] = by_overall["_pay_m"].apply(month_days)
-    num_same_o = (by_overall["cnt_same"] / by_overall["days_in_month"] * by_overall["_pay_m"].map(month_to_w)).sum()
-    num_prev_o = (by_overall["cnt_prev"] / by_overall["days_in_month"] * by_overall["_pay_m"].map(month_to_w)).sum()
-    den_o = by_overall["_pay_m"].map(month_to_w).sum()
+    w_all = by_overall["_pay_m"].map(month_to_w)
+    num_same_o = (by_overall["cnt_same"] / by_overall["days_in_month"] * w_all).sum()
+    num_prev_o = (by_overall["cnt_prev"] / by_overall["days_in_month"] * w_all).sum()
+    den_o = w_all.sum()
     overall_same_rate = float(num_same_o/den_o) if den_o > 0 else 0.0
     overall_prev_rate = float(num_prev_o/den_o) if den_o > 0 else 0.0
 
@@ -507,16 +478,6 @@ def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: i
 
 def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
                           lookback: int, weighted: bool, today: date):
-    """
-    Returns (table_df, totals_dict) with columns:
-      Source, A_Actual_ToDate, B_Remaining_SameMonth, C_Remaining_PrevMonths,
-      Projected_MonthEnd_Total, Rate_Same_Daily, Rate_Prev_Daily
-    A = actual payments (pay month = current), to date
-    B = remaining_days * daily_same_rate (from lookback)
-    C = remaining_days * daily_prev_rate  (from lookback)
-    Total projection = A + B + C
-    """
-    # Ensure source column
     if source_col is None or source_col not in df_f.columns:
         df_work = df_f.copy()
         source_col = "_Source"
@@ -589,7 +550,6 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
     return tbl, totals
 
 def predict_chart_stacked(tbl: pd.DataFrame):
-    """Stacked view: A + B + C = projection."""
     if tbl.empty:
         return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
     melt = tbl.melt(
@@ -615,13 +575,113 @@ def predict_chart_stacked(tbl: pd.DataFrame):
     ).properties(height=360, title="Predictibility (A + B + C = Projected Month-End)")
     return chart
 
+# ---- Backtest & accuracy ----
+def month_list_before(period_end: pd.Period, k: int):
+    months = []
+    p = period_end
+    for _ in range(k):
+        p = (p - 1)  # previous month
+        months.append(p)
+    months.reverse()
+    return months
+
+def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
+                      lookback: int, weighted: bool, backtest_months: int, today: date):
+    """Rolling-origin backtest across last `backtest_months` (excluding current month)."""
+    if source_col is None or source_col not in df_f.columns:
+        df_work = df_f.copy()
+        source_col = "_Source"
+        df_work[source_col] = "All"
+    else:
+        df_work = df_f.copy()
+
+    d = add_month_cols(df_work, create_col, pay_col)
+    current_period = pd.Period(today, freq="M")
+
+    months_to_eval = month_list_before(current_period, backtest_months)
+    rows = []
+    for m in months_to_eval:
+        # training window = the previous `lookback` pay-months strictly before m
+        train_months = month_list_before(m, lookback)
+        d_train = d[d["_pay_m"].isin(train_months)]
+        if d_train.empty:
+            same_rates, prev_rates, same_rate_o, prev_rate_o = {}, {}, 0.0, 0.0
+        else:
+            same_rates, prev_rates, same_rate_o, prev_rate_o = daily_rates_from_lookback(
+                d_train, source_col, lookback=len(train_months), weighted=weighted
+            )
+
+        # actuals in month m
+        d_m = d[d["_pay_m"] == m]
+        actual_total = int(len(d_m))
+        days_in_m = month_days(m)
+
+        # forecast: start-of-month (A=0) using trained daily rates
+        # aggregate per source with fallback
+        sources = set(list(same_rates.keys()) + list(prev_rates.keys()))
+        if not sources and source_col != "_Source":
+            # try sources that actually occurred in month m (so we have at least something)
+            sources = set(d_m[source_col].dropna().astype(str).unique().tolist())
+        if not sources:
+            sources = {"All"}  # single bucket
+
+        forecast = 0.0
+        for src in sources:
+            r_same = same_rates.get(src, same_rate_o)
+            r_prev = prev_rates.get(src, prev_rate_o)
+            forecast += (r_same + r_prev) * days_in_m
+
+        err = forecast - actual_total
+        rows.append({
+            "Month": str(m),
+            "Days": days_in_m,
+            "Forecast": float(forecast),
+            "Actual": float(actual_total),
+            "Error": float(err),
+            "AbsError": float(abs(err)),
+            "SqError": float(err**2),
+            "APE": float(abs(err) / actual_total) if actual_total > 0 else np.nan
+        })
+
+    bt = pd.DataFrame(rows)
+    if bt.empty:
+        return bt, {"MAPE": np.nan, "WAPE": np.nan, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan}
+
+    # Metrics
+    mae = bt["AbsError"].mean()
+    rmse = (bt["SqError"].mean())**0.5
+    # WAPE = sum(|err|)/sum(actual)
+    wape = (bt["AbsError"].sum() / bt["Actual"].sum()) if bt["Actual"].sum() > 0 else np.nan
+    # MAPE (ignore months with actual=0)
+    mape = bt["APE"].dropna().mean() if bt["APE"].notna().any() else np.nan
+    # R^2 on totals
+    ss_res = ((bt["Actual"] - bt["Forecast"])**2).sum()
+    ss_tot = ((bt["Actual"] - bt["Actual"].mean())**2).sum()
+    r2 = 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
+
+    metrics = {"MAPE": mape, "WAPE": wape, "MAE": mae, "RMSE": rmse, "R2": r2}
+    return bt, metrics
+
+def accuracy_scatter(bt: pd.DataFrame):
+    if bt.empty:
+        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
+    chart = alt.Chart(bt).mark_circle(size=120, opacity=0.8).encode(
+        x=alt.X("Actual:Q", title="Actual (month total)"),
+        y=alt.Y("Forecast:Q", title="Forecast (start-of-month)"),
+        tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Actual:Q"), alt.Tooltip("Forecast:Q"), alt.Tooltip("Error:Q")],
+    ).properties(height=360, title="Forecast vs Actual (by month)")
+    # 45-degree line
+    line = alt.Chart(pd.DataFrame({"x":[bt["Actual"].min(), bt["Actual"].max()],
+                                   "y":[bt["Actual"].min(), bt["Actual"].max()]})).mark_line()
+    return chart + line
+
 # ----------------------------
 # UI
 # ----------------------------
 with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio("Go to", ["MIS", "Predictibility"], index=0)
-    st.caption("Use MIS for status; Predictibility for month-end forecast (A/B/C).")
+    st.caption("Use MIS for status; Predictibility for month-end forecast (A/B/C) & accuracy.")
 
 st.title("📊 JetLearn MIS")
 st.markdown(
@@ -634,7 +694,7 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.write("Visualizes **Enrolments (Payments)**, **Conversion%**, **Trend**, and **Predictibility** for the running month.")
+st.write("Visualizes **Enrolments (Payments)**, **Conversion%**, **Trend**, and **Predictibility** with **Model Accuracy**.")
 
 # --- Data source
 col_ds1, col_ds2 = st.columns([3, 2])
@@ -809,14 +869,14 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Predictibility (A/B/C via lookback daily rates)
+# Predictibility (A/B/C via lookback daily rates) + Model Accuracy
 # ----------------------------
 if view == "Predictibility":
     st.subheader("Predictibility – Running Month Enrolment Forecast")
     st.caption(
         "A = payments received **to date** in the running month. "
-        "B = forecast for remaining days from **same-month created** deals using lookback daily rate. "
-        "C = forecast for remaining days from **previous-months created** deals using lookback daily rate. "
+        "B = forecast for remaining days from **same-month created** deals (lookback daily rate). "
+        "C = forecast for remaining days from **previous-months created** deals (lookback daily rate). "
         "Projected month-end = A + B + C."
     )
 
@@ -829,7 +889,7 @@ if view == "Predictibility":
     with colp3:
         st.info("Daily rates are computed per source from the last K pay-months (excluding current). Recency weighting uses 1..K.")
 
-    # Sanity: payments in current month (after filters)
+    # Payments in current month (after filters)
     cur_start, cur_end = month_bounds(today)
     d_preview = add_month_cols(df_f, create_col, pay_col)
     cur_period = pd.Period(today, freq="M")
@@ -863,6 +923,42 @@ if view == "Predictibility":
             st.dataframe(view_tbl, use_container_width=True)
         else:
             st.info("No data in scope for the running month after filters.")
+
+    # ----- NEW: Model Accuracy (Backtest) -----
+    st.subheader("Model Accuracy (Backtest)")
+    colb1, colb2 = st.columns([1,3])
+    with colb1:
+        backtest_k = st.selectbox("Backtest months", [3, 6, 12], index=0,
+                                  help="How many recent months to evaluate (excluding current).")
+    with colb2:
+        st.caption("For each backtested month, we forecast using only the prior lookback window and compare to actual.")
+
+    bt, metrics = backtest_accuracy(df_f, create_col, pay_col, source_col,
+                                    lookback=lookback, weighted=weighted,
+                                    backtest_months=backtest_k, today=today)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    def fmt(x, pct=False):
+        if pd.isna(x):
+            return "–"
+        return f"{x*100:.1f}%" if pct else f"{x:.2f}"
+    with m1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAPE</div><div class='kpi-value'>{fmt(metrics['MAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
+    with m2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>WAPE</div><div class='kpi-value'>{fmt(metrics['WAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
+    with m3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAE</div><div class='kpi-value'>{fmt(metrics['MAE'])}</div></div>", unsafe_allow_html=True)
+    with m4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>RMSE</div><div class='kpi-value'>{fmt(metrics['RMSE'])}</div></div>", unsafe_allow_html=True)
+    with m5: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>R²</div><div class='kpi-value'>{fmt(metrics['R2'])}</div></div>", unsafe_allow_html=True)
+
+    if bt.empty:
+        st.info("Not enough historical data to backtest with the chosen settings.")
+    else:
+        st.altair_chart(accuracy_scatter(bt), use_container_width=True)
+        with st.expander("Backtest details"):
+            show = bt.copy()
+            for c in ["Forecast","Actual","Error","AbsError","SqError"]:
+                show[c] = show[c].round(2)
+            if show["APE"].notna().any():
+                show["APE%"] = (show["APE"]*100).round(1)
+            st.dataframe(show.drop(columns=["APE"]), use_container_width=True)
 
 # Optional: data preview
 with st.expander("Data preview & column mapping", expanded=False):
