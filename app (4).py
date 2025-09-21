@@ -972,3 +972,61 @@ with st.expander("Data preview & column mapping", expanded=False):
         "Deal Stage": dealstage_col or "Not found",
     })
     st.dataframe(df.head(20))
+# ----- Model Accuracy (Backtest) -----
+st.subheader("Model Accuracy")
+
+colb1, colb2 = st.columns([1,3])
+with colb1:
+    backtest_k = st.selectbox(
+        "Backtest months",
+        [3, 6, 12], index=0,
+        help="How many recent months to evaluate (excluding current)."
+    )
+with colb2:
+    st.caption("Each backtested month is forecast using only the prior lookback window and compared to actual.")
+
+bt, metrics = backtest_accuracy(
+    df_f, create_col, pay_col, source_col,
+    lookback=lookback, weighted=weighted,
+    backtest_months=backtest_k, today=today
+)
+
+# Single-number accuracy (prefer WAPE; fallback to MAPE)
+acc_pct = np.nan
+if not pd.isna(metrics.get("WAPE", np.nan)):
+    acc_pct = max(0.0, min(100.0, (1.0 - metrics["WAPE"]) * 100.0))
+elif not pd.isna(metrics.get("MAPE", np.nan)):
+    acc_pct = max(0.0, min(100.0, (1.0 - metrics["MAPE"]) * 100.0))
+
+st.markdown(
+    f"<div class='kpi-card'><div class='kpi-title'>Model Accuracy (100 − WAPE)</div>"
+    f"<div class='kpi-value'>{'–' if pd.isna(acc_pct) else f'{acc_pct:.1f}%'}"
+    f"</div></div>",
+    unsafe_allow_html=True,
+)
+
+# Optional detail toggle
+show_details = st.checkbox("Show detailed metrics", value=False)
+
+if show_details:
+    m1, m2, m3, m4, m5 = st.columns(5)
+    def fmt(x, pct=False):
+        if pd.isna(x): return "–"
+        return f"{x*100:.1f}%" if pct else f"{x:.2f}"
+    with m1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAPE</div><div class='kpi-value'>{fmt(metrics['MAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
+    with m2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>WAPE</div><div class='kpi-value'>{fmt(metrics['WAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
+    with m3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAE</div><div class='kpi-value'>{fmt(metrics['MAE'])}</div></div>", unsafe_allow_html=True)
+    with m4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>RMSE</div><div class='kpi-value'>{fmt(metrics['RMSE'])}</div></div>", unsafe_allow_html=True)
+    with m5: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>R²</div><div class='kpi-value'>{fmt(metrics['R2'])}</div></div>", unsafe_allow_html=True)
+
+    if bt.empty:
+        st.info("Not enough historical data to backtest with the chosen settings.")
+    else:
+        st.altair_chart(accuracy_scatter(bt), use_container_width=True)
+        with st.expander("Backtest details"):
+            show = bt.copy()
+            for c in ["Forecast","Actual","Error","AbsError","SqError"]:
+                show[c] = show[c].round(2)
+            if show["APE"].notna().any():
+                show["APE%"] = (show["APE"]*100).round(1)
+            st.dataframe(show.drop(columns=["APE"]), use_container_width=True)
