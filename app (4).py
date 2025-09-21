@@ -4,6 +4,7 @@ import numpy as np
 import altair as alt
 from datetime import datetime, date, timedelta
 import math
+import re  # NEW
 
 st.set_page_config(
     page_title="JetLearn MIS – Enrolments (MTD & Cohort) + Conversion%",
@@ -57,12 +58,12 @@ st.markdown(
 
 # ---------- Color palette ----------
 PALETTE = {
-    "Total": "#6b7280",      # gray-500
-    "AI Coding": "#2563eb",  # blue-600
-    "Math": "#16a34a",       # green-600
-    "ThresholdLow": "#f3f4f6",   # gray-100
-    "ThresholdMid": "#e5e7eb",   # gray-200
-    "ThresholdHigh": "#d1d5db",  # gray-300
+    "Total": "#6b7280",
+    "AI Coding": "#2563eb",
+    "Math": "#16a34a",
+    "ThresholdLow": "#f3f4f6",
+    "ThresholdMid": "#e5e7eb",
+    "ThresholdHigh": "#d1d5db",
 }
 
 # ----------------------------
@@ -137,6 +138,18 @@ def apply_filters(
         f = f[f[source_col].astype(str).isin(sel_sources)]
     return f
 
+# NEW: strict, always-on exclusion for Invalid Deals
+INVALID_RE = re.compile(r"^\s*1\.2\s*invalid\s*deal[s]?\s*$", flags=re.IGNORECASE)
+
+def exclude_invalid_deals(df: pd.DataFrame, dealstage_col: str | None) -> tuple[pd.DataFrame, int]:
+    """Return (filtered_df, removed_count). If column missing, returns original df, 0."""
+    if not dealstage_col:
+        return df, 0
+    col = df[dealstage_col].astype(str)
+    mask_keep = ~col.apply(lambda x: bool(INVALID_RE.match(x)))
+    removed = int((~mask_keep).sum())
+    return df.loc[mask_keep].copy(), removed
+
 # ---------- COUNT LOGIC ----------
 def prepare_counts_for_range(
     df: pd.DataFrame,
@@ -147,7 +160,6 @@ def prepare_counts_for_range(
     pay_col: str,
     pipeline_col: str | None
 ):
-    """(mtd_counts, cohort_counts)"""
     df = df.copy()
     df["_create_dt"] = coerce_datetime(df[create_col])
     df["_pay_dt"] = coerce_datetime(df[pay_col])
@@ -178,7 +190,7 @@ def prepare_counts_for_range(
     }
     return mtd_counts, cohort_counts
 
-# ---------- CONVERSION% LOGIC (per-pipeline denominators) ----------
+# ---------- CONVERSION% LOGIC ----------
 def deals_created_mask_anchor(df: pd.DataFrame, running_month_any_date: date, create_col: str) -> pd.Series:
     d = df.copy()
     d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
@@ -198,15 +210,11 @@ def prepare_conversion_for_range(
     pay_col: str,
     pipeline_col: str | None,
     *,
-    denom_mode: str = "anchor",                  # "anchor" or "range"
-    running_month_anchor: date | None = None,    # required if denom_mode="anchor"
-    denom_start: date | None = None,             # required if denom_mode="range"
+    denom_mode: str = "anchor",
+    running_month_anchor: date | None = None,
+    denom_start: date | None = None,
     denom_end: date | None = None
 ):
-    """
-    Returns:
-      mtd_pct, coh_pct, denoms, numerators  (keys: "Total","AI Coding","Math")
-    """
     d = df.copy()
     d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
     d["_pay_dt"] = coerce_datetime(d[pay_col]).dt.date
@@ -345,7 +353,7 @@ def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
     text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text=alt.Text("Value:Q"))
     return (circles + text).properties(height=360, title=title)
 
-# ---------- TREND (bar + two lines, dual y) ----------
+# ---------- TREND ----------
 def trend_timeseries(
     df: pd.DataFrame,
     payments_start: date,
@@ -447,32 +455,26 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.write(
-    "Visualizes **Enrolments (Payments)**, **Conversion%** (per-pipeline denominators), and **Trend**."
-)
+st.write("Visualizes **Enrolments (Payments)**, **Conversion%** (per-pipeline denominators), and **Trend**.")
 
-# --- Data source + exclude invalid deals toggle (SIDE-BY-SIDE) ---
+# --- Data source (no checkbox; exclusion is ALWAYS ON) ---
 col_ds1, col_ds2 = st.columns([3, 2])
 with col_ds1:
-    default_path = "Master_sheet_DB.csv"
+    default_path = "Master_sheet_DB.csv"  # if you uploaded, keep the same filename in app directory
     data_src = st.text_input("Data file path", value=default_path, help="CSV path (pre-uploaded in the repo).")
 with col_ds2:
-    exclude_invalid = st.checkbox("Exclude “1.2 Invalid deals” (Deal Stage)", value=True,
-                                  help="Filters out rows where Deal Stage equals '1.2 Invalid deals' (case-insensitive).")
+    st.caption("‘1.2 Invalid Deal(s)’ are automatically excluded from all views.")
 
 # --- Load data
 df = load_data(data_src)
 
-# Identify Deal Stage column and exclude if asked
+# Identify Deal Stage column and exclude invalids (always)
 dealstage_col = find_col(df, ["Deal Stage", "Deal stage", "Stage", "Deal Status", "Stage Name", "Deal Stage Name"])
-if exclude_invalid:
-    if dealstage_col:
-        mask_keep = ~df[dealstage_col].astype(str).str.strip().str.lower().eq("1.2 invalid deals")
-        removed = int((~mask_keep).sum())
-        df = df.loc[mask_keep].copy()
-        st.caption(f"Excluded “1.2 Invalid deals”: **{removed:,}** rows (column: **{dealstage_col}**).")
-    else:
-        st.info("Deal Stage column not found — cannot exclude “1.2 Invalid deals”.")
+df, _removed = exclude_invalid_deals(df, dealstage_col)
+if dealstage_col:
+    st.caption(f"Excluded “1.2 Invalid Deal(s)”: **{_removed:,}** rows (column: **{dealstage_col}**).")
+else:
+    st.info("Deal Stage column not found — cannot exclude “1.2 Invalid Deal(s)”. Make sure the column exists.")
 
 # --- Resolve columns
 create_col = find_col(df, ["Create Date", "Create date", "Create_Date", "Created At"])
@@ -551,7 +553,7 @@ def render_period_block(title: str, range_start: date, range_end: date, running_
             use_container_width=True
         )
 
-    # Conversion% (per-pipeline denominators) → Bullet gauges
+    # Conversion% (per-pipeline denominators)
     mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
         df_f, range_start, range_end, create_col, pay_col, pipeline_col,
         denom_mode="anchor", running_month_anchor=running_month_anchor
@@ -621,7 +623,7 @@ if view == "MIS":
                     with c2:
                         st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
 
-                    # Conversion → bullet gauges (per-pipeline denoms)
+                    # Conversion → bullet gauges
                     mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
                         df_f, custom_start, custom_end, create_col, pay_col, pipeline_col,
                         denom_mode="anchor", running_month_anchor=anchor
