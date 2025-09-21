@@ -51,6 +51,8 @@ st.markdown(
         margin-top: .25rem;
         margin-bottom: .25rem;
       }
+      /* make sidebar data source area feel lighter */
+      .sidebar-note { font-size: 0.85rem; color: #6b7280; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -319,22 +321,16 @@ def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
     data = pd.DataFrame({
         "Label": ["Total", "AI Coding", "Math"],
         "Value": [total, ai_cnt, math_cnt],
-        "Row": [0, 1, 1],
-        "Col": [0.5, 0.33, 0.66],
     })
     color_domain = ["Total", "AI Coding", "Math"]
     color_range  = [PALETTE["Total"], PALETTE["AI Coding"], PALETTE["Math"]]
     base = alt.Chart(data).encode(
-        x=alt.X("Col:Q", axis=None, scale=alt.Scale(domain=(0, 1))),
-        y=alt.Y("Row:Q", axis=None, scale=alt.Scale(domain=(-0.2, 1.2))),
+        x=alt.X("Label:N", axis=alt.Axis(title=None)),
+        y=alt.Y("Value:Q"),
+        color=alt.Color("Label:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
         tooltip=[alt.Tooltip("Label:N"), alt.Tooltip("Value:Q")],
     )
-    circles = base.mark_circle(opacity=0.85).encode(
-        size=alt.Size("Value:Q", scale=alt.Scale(range=[400, 8000]), legend=None),
-        color=alt.Color("Label:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
-    )
-    text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text=alt.Text("Value:Q"))
-    return (circles + text).properties(height=360, title=title)
+    return base.mark_bar().properties(height=260, title=title)
 
 def trend_timeseries(
     df: pd.DataFrame,
@@ -419,7 +415,7 @@ def trend_chart(ts: pd.DataFrame, title: str):
     return alt.layer(bars, line_mtd, line_coh).resolve_scale(y='independent').properties(title=title)
 
 # ----------------------------
-# Predictibility core (A/B/C via lookback daily rates) + Accuracy
+# Predictibility core (A/B/C via recency-weighted lookback) + Accuracy
 # ----------------------------
 def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFrame:
     d = df.copy()
@@ -441,7 +437,7 @@ def per_source_monthly_counts(d_hist: pd.DataFrame, source_col: str):
     by["days_in_month"] = by["_pay_m"].apply(month_days)
     return by
 
-def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: int, weighted: bool):
+def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: int, weighted: bool=True):
     if d_hist.empty:
         return {}, {}, 0.0, 0.0
 
@@ -477,12 +473,11 @@ def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: i
     return rates_same, rates_prev, overall_same_rate, overall_prev_rate
 
 def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
-                          lookback: int, weighted: bool, today: date):
+                          lookback: int, today: date):
     """
     A = actual payments (pay month = current), to date
-    B = remaining_days * daily_same_rate (from lookback)
-    C = remaining_days * daily_prev_rate  (from lookback)
-    Total projection = A + B + C
+    B = remaining_days * daily_same_rate (recency-weighted lookback)
+    C = remaining_days * daily_prev_rate  (recency-weighted lookback)
     """
     if source_col is None or source_col not in df_f.columns:
         df_work = df_f.copy()
@@ -492,21 +487,17 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
         df_work = df_f.copy()
 
     d = add_month_cols(df_work, create_col, pay_col)
-
     cur_start, cur_end = month_bounds(today)
     cur_period = pd.Period(today, freq="M")
 
     # A: realized payments this month
     d_cur = d[d["_pay_m"] == cur_period].copy()
-    if d_cur.empty:
-        realized_by_src = pd.DataFrame(columns=[source_col, "A"])
-    else:
-        realized_by_src = d_cur.groupby(source_col).size().rename("A").reset_index()
+    realized_by_src = d_cur.groupby(source_col).size().rename("A").reset_index() if not d_cur.empty else pd.DataFrame(columns=[source_col, "A"])
 
     # Lookback history (exclude current pay month)
     d_hist = d[d["_pay_m"] < cur_period].copy()
     rates_same, rates_prev, overall_same_rate, overall_prev_rate = daily_rates_from_lookback(
-        d_hist, source_col, lookback, weighted
+        d_hist, source_col, lookback, weighted=True
     )
 
     # Remaining days
@@ -592,8 +583,8 @@ def month_list_before(period_end: pd.Period, k: int):
     return months
 
 def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
-                      lookback: int, weighted: bool, backtest_months: int, today: date):
-    """Rolling-origin backtest across last `backtest_months` (excluding current month)."""
+                      lookback: int, today: date):
+    """Rolling-origin backtest across the same lookback window (recency-weighted)."""
     if source_col is None or source_col not in df_f.columns:
         df_work = df_f.copy()
         source_col = "_Source"
@@ -604,7 +595,7 @@ def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_
     d = add_month_cols(df_work, create_col, pay_col)
     current_period = pd.Period(today, freq="M")
 
-    months_to_eval = month_list_before(current_period, backtest_months)
+    months_to_eval = month_list_before(current_period, lookback)
     rows = []
     for m in months_to_eval:
         train_months = month_list_before(m, lookback)
@@ -613,7 +604,7 @@ def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_
             same_rates, prev_rates, same_rate_o, prev_rate_o = {}, {}, 0.0, 0.0
         else:
             same_rates, prev_rates, same_rate_o, prev_rate_o = daily_rates_from_lookback(
-                d_train, source_col, lookback=len(train_months), weighted=weighted
+                d_train, source_col, lookback=len(train_months), weighted=True
             )
 
         d_m = d[d["_pay_m"] == m]
@@ -672,13 +663,26 @@ def accuracy_scatter(bt: pd.DataFrame):
     return chart + line
 
 # ----------------------------
-# UI
+# Sidebar (App drawer)
 # ----------------------------
 with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio("Go to", ["MIS", "Predictibility"], index=0)
-    st.caption("Use MIS for status; Predictibility for month-end forecast (A/B/C) & accuracy.")
+    st.caption("Use MIS for status; Predictibility for month-end forecast & accuracy.")
 
+    st.markdown("<hr/>", unsafe_allow_html=True)
+    with st.expander("Data source (advanced)", expanded=False):
+        default_path = "Master_sheet_DB.csv"
+        data_src = st.text_input("CSV path", value=default_path, help="Pre-uploaded in the repo.")
+        st.markdown("<div class='sidebar-note'>Less prominent: tweak only if you need a different file.</div>", unsafe_allow_html=True)
+
+# If user didn't open the expander, ensure data_src exists
+if "data_src" not in locals():
+    data_src = "Master_sheet_DB.csv"
+
+# ----------------------------
+# Main header
+# ----------------------------
 st.title("📊 JetLearn MIS")
 st.markdown(
     """
@@ -691,14 +695,6 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.write("Visualizes **Enrolments (Payments)**, **Conversion%**, **Trend**, and **Predictibility** with **Model Accuracy**.")
-
-# --- Data source
-col_ds1, col_ds2 = st.columns([3, 2])
-with col_ds1:
-    default_path = "Master_sheet_DB.csv"
-    data_src = st.text_input("Data file path", value=default_path, help="CSV path (pre-uploaded in the repo).")
-with col_ds2:
-    st.caption("Auto-excludes ‘1.2 Invalid deal(s)’ • Drops rows with missing **Create Date**")
 
 # --- Load & clean data
 df = load_data(data_src)
@@ -734,8 +730,8 @@ yday = today - timedelta(days=1)
 last_m_start, last_m_end = last_month_bounds(today)
 this_m_start, this_m_end = month_bounds(today)
 
-# --- Filters UI (scope)
-with st.expander("Filters", expanded=True):
+# --- Filters (collapsed by default)
+with st.expander("Filters", expanded=False):
     def prep_options(series: pd.Series):
         vals = sorted([str(v) for v in series.dropna().unique()])
         return ["All"] + vals
@@ -762,7 +758,7 @@ with st.expander("Filters", expanded=True):
         st.info("JetLearn Deal Source column not found. Skipping this filter.")
 
 # Apply filters to define scope
-df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellors, sel_countries, sel_sources)
+df_f = apply_filters(df, counsellor_col, country_col, source_col, locals().get("sel_counsellors", []), locals().get("sel_countries", []), locals().get("sel_sources", []))
 st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
 
 # ----------------------------
@@ -802,6 +798,9 @@ def render_period_block(title: str, range_start: date, range_end: date, running_
     bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
     ts = trend_timeseries(df_f, range_start, range_end, denom_mode="anchor", running_month_anchor=running_month_anchor, create_col=create_col, pay_col=pay_col)
     st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
+
+if st.session_state.get("view_override"):
+    view = st.session_state["view_override"]
 
 if view == "MIS":
     show_all = st.checkbox("Show all preset periods (Yesterday • Today • Last Month • This Month)", value=False)
@@ -863,37 +862,31 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Predictibility (A/B/C) + Model Accuracy (tied to lookback)
+# Predictibility (A/B/C) + Model Accuracy (lookback; recency-weighted)
 # ----------------------------
 if view == "Predictibility":
     st.subheader("Predictibility – Running Month Enrolment Forecast")
     st.caption(
         "A = payments received **to date** in the running month. "
-        "B = forecast for remaining days from **same-month created** deals (lookback daily rate). "
-        "C = forecast for remaining days from **previous-months created** deals (lookback daily rate). "
+        "B = forecast for remaining days from **same-month created** deals (recency-weighted daily rate). "
+        "C = forecast for remaining days from **previous-months created** deals (recency-weighted daily rate). "
         "Projected month-end = A + B + C."
     )
 
-    colp1, colp2, colp3 = st.columns([1,1,2])
+    colp1, colp2 = st.columns([1,3])
     with colp1:
         lookback = st.selectbox("Lookback window (months)", [3, 6, 12], index=0)
     with colp2:
-        weighting = st.radio("Averaging", ["Recency-weighted", "Simple average"], index=0, horizontal=False)
-        weighted = (weighting == "Recency-weighted")
-    with colp3:
-        st.info("Daily rates are computed per source from the last K pay-months (excluding current). Recency weighting uses 1..K.")
+        st.info("Daily rates come from the last K pay-months (1..K weighting).")
 
-    # Payments in current month (after filters)
     cur_start, cur_end = month_bounds(today)
     d_preview = add_month_cols(df_f, create_col, pay_col)
     cur_period = pd.Period(today, freq="M")
     in_cur_pay = d_preview["_pay_m"] == cur_period
     st.caption(f"Payments found this month (after filters): **{int(in_cur_pay.sum()):,}**")
 
-    # Compute A/B/C overall
-    tbl, totals = predict_running_month(df_f, create_col, pay_col, source_col, lookback, weighted, today)
+    tbl, totals = predict_running_month(df_f, create_col, pay_col, source_col, lookback, today)
 
-    # KPI cards
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(f"<div class='kpi-card'><div class='kpi-title'>A · Actual to date</div><div class='kpi-value' style='color:{PALETTE['A_actual']}'>{totals['A_Actual_ToDate']:.1f}</div></div>", unsafe_allow_html=True)
@@ -904,7 +897,6 @@ if view == "Predictibility":
     with c4:
         st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Projected Month-End</div><div class='kpi-value' style='color:{PALETTE['Total']}'>{totals['Projected_MonthEnd_Total']:.1f}</div><div class='kpi-sub'>A + B + C</div></div>", unsafe_allow_html=True)
 
-    # Stacked chart (A + B + C = projection)
     st.altair_chart(predict_chart_stacked(tbl), use_container_width=True)
 
     with st.expander("Detailed table (by source)"):
@@ -920,15 +912,13 @@ if view == "Predictibility":
         else:
             st.info("No data in scope for the running month after filters.")
 
-    # ----- Model Accuracy (tied to lookback) -----
+    # ----- Model Accuracy (tied to lookback; recency-weighted) -----
     st.subheader("Model Accuracy")
-    st.caption(f"Accuracy is computed using a rolling backtest over the same lookback window you selected above (**{lookback} months**).")
+    st.caption(f"Accuracy is computed using a rolling backtest over the same lookback window (**{lookback} months**), recency-weighted.")
 
     bt, metrics = backtest_accuracy(
         df_f, create_col, pay_col, source_col,
-        lookback=lookback, weighted=weighted,
-        backtest_months=lookback,  # <— tie accuracy window to lookback
-        today=today
+        lookback=lookback, today=today
     )
 
     # Single-number accuracy (prefer WAPE; fallback to MAPE)
@@ -961,13 +951,6 @@ if view == "Predictibility":
             st.info("Not enough historical data to backtest with the chosen settings.")
         else:
             st.altair_chart(accuracy_scatter(bt), use_container_width=True)
-            with st.expander("Backtest details"):
-                show = bt.copy()
-                for c in ["Forecast","Actual","Error","AbsError","SqError"]:
-                    show[c] = show[c].round(2)
-                if show["APE"].notna().any():
-                    show["APE%"] = (show["APE"]*100).round(1)
-                st.dataframe(show.drop(columns=["APE"]), use_container_width=True)
 
 # Optional: data preview
 with st.expander("Data preview & column mapping", expanded=False):
@@ -979,5 +962,6 @@ with st.expander("Data preview & column mapping", expanded=False):
         "Country": country_col or "Not found",
         "JetLearn Deal Source": source_col or "Not found",
         "Deal Stage": dealstage_col or "Not found",
+        "CSV": data_src,
     })
     st.dataframe(df.head(20))
