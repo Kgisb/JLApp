@@ -51,12 +51,32 @@ st.markdown(
         margin-top: .25rem;
         margin-bottom: .25rem;
       }
-      /* make sidebar data source area feel lighter */
+      /* info pill */
+      .info-pill {
+        display:inline-block; width:18px; height:18px; border-radius:50%;
+        background:#e5e7eb; color:#111827; text-align:center; line-height:18px;
+        font-weight:700; font-size:12px; cursor:default; position:relative;
+        margin-left:8px;
+      }
+      .info-pill .tip {
+        position:absolute; left:24px; top:50%; transform:translateY(-50%);
+        background:#111827; color:#fff; padding:8px 10px; border-radius:8px;
+        max-width:480px; font-size:.85rem; line-height:1.25;
+        box-shadow:0 6px 20px rgba(0,0,0,.18);
+        opacity:0; visibility:hidden; transition:opacity .12s ease, visibility .12s ease;
+        z-index: 9999;
+      }
+      .info-pill:hover .tip { opacity:1; visibility:visible; }
+      /* sidebar note */
       .sidebar-note { font-size: 0.85rem; color: #6b7280; }
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+# ---------- Tiny helper to render a hover info icon ----------
+def info_pill(text: str):
+    st.markdown(f"""<span class="info-pill">i<span class="tip">{text}</span></span>""", unsafe_allow_html=True)
 
 # ---------- Color palette ----------
 PALETTE = {
@@ -66,11 +86,10 @@ PALETTE = {
     "ThresholdLow": "#f3f4f6",
     "ThresholdMid": "#e5e7eb",
     "ThresholdHigh": "#d1d5db",
-
     # Predictibility
-    "A_actual": "#2563eb",          # blue
-    "Rem_prev": "#6b7280",          # gray
-    "Rem_same": "#16a34a",          # green
+    "A_actual": "#2563eb",
+    "Rem_prev": "#6b7280",
+    "Rem_same": "#16a34a",
 }
 
 # ----------------------------
@@ -457,7 +476,7 @@ def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: i
         rates_same[str(src)] = float(num_same/den) if den > 0 else 0.0
         rates_prev[str(src)] = float(num_prev/den) if den > 0 else 0.0
 
-    # Overall fallback
+    # Overall fallback (if a source not in history appears this month)
     by_overall = d_hist.groupby("_pay_m")["_same_month"].agg(
         cnt_same=lambda s: int(s.sum()),
         cnt_prev=lambda s: int((~s).sum())
@@ -668,7 +687,6 @@ def accuracy_scatter(bt: pd.DataFrame):
 with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio("Go to", ["MIS", "Predictibility"], index=0)
-    st.caption("Use MIS for status; Predictibility for month-end forecast & accuracy.")
 
     st.markdown("<hr/>", unsafe_allow_html=True)
     with st.expander("Data source (advanced)", expanded=False):
@@ -676,7 +694,6 @@ with st.sidebar:
         data_src = st.text_input("CSV path", value=default_path, help="Pre-uploaded in the repo.")
         st.markdown("<div class='sidebar-note'>Less prominent: tweak only if you need a different file.</div>", unsafe_allow_html=True)
 
-# If user didn't open the expander, ensure data_src exists
 if "data_src" not in locals():
     data_src = "Master_sheet_DB.csv"
 
@@ -694,7 +711,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.write("Visualizes **Enrolments (Payments)**, **Conversion%**, **Trend**, and **Predictibility** with **Model Accuracy**.")
 
 # --- Load & clean data
 df = load_data(data_src)
@@ -758,7 +774,10 @@ with st.expander("Filters", expanded=False):
         st.info("JetLearn Deal Source column not found. Skipping this filter.")
 
 # Apply filters to define scope
-df_f = apply_filters(df, counsellor_col, country_col, source_col, locals().get("sel_counsellors", []), locals().get("sel_countries", []), locals().get("sel_sources", []))
+df_f = apply_filters(df, counsellor_col, country_col, source_col,
+                     locals().get("sel_counsellors", []),
+                     locals().get("sel_countries", []),
+                     locals().get("sel_sources", []))
 st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
 
 # ----------------------------
@@ -785,13 +804,20 @@ def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict):
     st.altair_chart(bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], nums.get("Math",0), denoms.get("Math",0)), use_container_width=True)
 
 def render_period_block(title: str, range_start: date, range_end: date, running_month_anchor: date):
-    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
+    # header + tiny info
+    cols = st.columns([1, 0.05])
+    with cols[0]:
+        st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
+    with cols[1]:
+        info_pill("Shows MTD & Cohort counts, Conversion% and a trend chart for the selected period.")
+
     mtd_counts, coh_counts = prepare_counts_for_range(df_f, range_start, range_end, running_month_anchor, create_col, pay_col, pipeline_col)
     c1, c2 = st.columns(2)
     with c1:
         st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"]), use_container_width=True)
     with c2:
         st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
+
     mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(df_f, range_start, range_end, create_col, pay_col, pipeline_col, denom_mode="anchor", running_month_anchor=running_month_anchor)
     st.caption(f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}")
     bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
@@ -799,8 +825,25 @@ def render_period_block(title: str, range_start: date, range_end: date, running_
     ts = trend_timeseries(df_f, range_start, range_end, denom_mode="anchor", running_month_anchor=running_month_anchor, create_col=create_col, pay_col=pay_col)
     st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
-if st.session_state.get("view_override"):
-    view = st.session_state["view_override"]
+# ----------------------------
+# Views
+# ----------------------------
+with st.sidebar:
+    # already rendered "view" above; keep it simple
+    pass
+
+if st.sidebar.radio if False else True:  # no-op to keep structure simple
+    pass
+
+# default view selection from sidebar
+with st.sidebar:
+    current_view = st.session_state.get("view", None)
+    # streamlit already keeps radio state; nothing else needed
+
+# Decide view
+# We reuse the 'view' variable created earlier in sidebar
+if 'view' not in locals():
+    view = "MIS"
 
 if view == "MIS":
     show_all = st.checkbox("Show all preset periods (Yesterday • Today • Last Month • This Month)", value=False)
@@ -822,7 +865,12 @@ if view == "MIS":
         with tabs[2]: render_period_block("Last Month", last_m_start, last_m_end, last_m_start)
         with tabs[3]: render_period_block("This Month", this_m_start, this_m_end, this_m_start)
         with tabs[4]:
-            st.markdown("Select a **payments period** and choose the **Conversion% denominator** mode.")
+            cols = st.columns([1, 0.05])
+            with cols[0]:
+                st.markdown("<div class='section-title'>Custom</div>", unsafe_allow_html=True)
+            with cols[1]:
+                info_pill("Choose any payments period and set how the denominator is computed (anchor month or custom range).")
+
             colc1, colc2 = st.columns(2)
             with colc1: custom_start = st.date_input("Payments period start", value=this_m_start)
             with colc2: custom_end   = st.date_input("Payments period end (inclusive)", value=this_m_end)
@@ -862,22 +910,26 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Predictibility (A/B/C) + Model Accuracy (lookback; recency-weighted)
+# Predictibility (A/B/C) + Model Accuracy
 # ----------------------------
 if view == "Predictibility":
-    st.subheader("Predictibility – Running Month Enrolment Forecast")
-    st.caption(
-        "A = payments received **to date** in the running month. "
-        "B = forecast for remaining days from **same-month created** deals (recency-weighted daily rate). "
-        "C = forecast for remaining days from **previous-months created** deals (recency-weighted daily rate). "
-        "Projected month-end = A + B + C."
-    )
+    cols = st.columns([1, 0.05])
+    with cols[0]:
+        st.subheader("Predictibility – Running Month Enrolment Forecast")
+    with cols[1]:
+        info_pill(
+            "A = payments received to date in the running month. "
+            "B = forecast for remaining days from same-month created deals (recency-weighted daily rate). "
+            "C = forecast for remaining days from previous-months created deals (recency-weighted daily rate). "
+            "Projected month-end = A + B + C."
+        )
 
     colp1, colp2 = st.columns([1,3])
     with colp1:
         lookback = st.selectbox("Lookback window (months)", [3, 6, 12], index=0)
     with colp2:
-        st.info("Daily rates come from the last K pay-months (1..K weighting).")
+        # subtle info pill instead of long text
+        info_pill("Daily rates come from the last K pay-months (excluding current), weighted 1..K for recency.")
 
     cur_start, cur_end = month_bounds(today)
     d_preview = add_month_cols(df_f, create_col, pay_col)
@@ -913,15 +965,17 @@ if view == "Predictibility":
             st.info("No data in scope for the running month after filters.")
 
     # ----- Model Accuracy (tied to lookback; recency-weighted) -----
-    st.subheader("Model Accuracy")
-    st.caption(f"Accuracy is computed using a rolling backtest over the same lookback window (**{lookback} months**), recency-weighted.")
+    cols_acc = st.columns([1, 0.05])
+    with cols_acc[0]:
+        st.subheader("Model Accuracy")
+    with cols_acc[1]:
+        info_pill("Accuracy is shown as 100 − WAPE over the same lookback window (rolling backtest).")
 
     bt, metrics = backtest_accuracy(
         df_f, create_col, pay_col, source_col,
         lookback=lookback, today=today
     )
 
-    # Single-number accuracy (prefer WAPE; fallback to MAPE)
     acc_pct = np.nan
     if not pd.isna(metrics.get("WAPE", np.nan)):
         acc_pct = max(0.0, min(100.0, (1.0 - metrics["WAPE"]) * 100.0))
