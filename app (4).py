@@ -450,7 +450,6 @@ def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: i
     d_hist = d_hist[d_hist["_pay_m"].isin(months)].copy()
 
     by = per_source_monthly_counts(d_hist, source_col)
-
     month_to_w = {m: (i+1 if weighted else 1.0) for i, m in enumerate(sorted(months))}
 
     rates_same, rates_prev = {}, {}
@@ -608,7 +607,6 @@ def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_
     months_to_eval = month_list_before(current_period, backtest_months)
     rows = []
     for m in months_to_eval:
-        # training window = the previous `lookback` pay-months strictly before m
         train_months = month_list_before(m, lookback)
         d_train = d[d["_pay_m"].isin(train_months)]
         if d_train.empty:
@@ -618,12 +616,10 @@ def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_
                 d_train, source_col, lookback=len(train_months), weighted=weighted
             )
 
-        # actuals in month m
         d_m = d[d["_pay_m"] == m]
         actual_total = int(len(d_m))
         days_in_m = month_days(m)
 
-        # forecast at start of month m
         sources = set(list(same_rates.keys()) + list(prev_rates.keys()))
         if not sources and source_col != "_Source":
             sources = set(d_m[source_col].dropna().astype(str).unique().tolist())
@@ -675,6 +671,116 @@ def accuracy_scatter(bt: pd.DataFrame):
                                    "y":[bt["Actual"].min(), bt["Actual"].max()]})).mark_line()
     return chart + line
 
+# --------- NEW: Grouped break-up helpers ----------
+def predict_running_month_grouped(df_f: pd.DataFrame, group_cols: list[str],
+                                  create_col: str, pay_col: str, source_col: str,
+                                  lookback: int, weighted: bool, today: date):
+    """
+    For each unique combination in group_cols, compute A/B/C totals by
+    reusing the same forecasting logic on that subset.
+    """
+    if not group_cols:
+        return pd.DataFrame()
+
+    # Build friendly names
+    d = add_month_cols(df_f.copy(), create_col, pay_col)
+
+    # If Day is included, we only show A by payment date (current month)
+    is_day_split = "_day" in group_cols
+    display_cols = [c for c in group_cols if c != "_day"]
+
+    # Prepare mapping columns
+    cur_period = pd.Period(today, freq="M")
+    d["_Day"] = d["_pay_dt"].dt.date
+    rename_map = {}
+    if counsellor_col and "Counsellor" in group_cols:
+        d["Counsellor"] = d[counsellor_col].astype(str)
+        rename_map["Counsellor"] = "Academic Counsellor"
+    if country_col and "Country" in group_cols:
+        d["Country"] = d[country_col].astype(str)
+    if source_col and "Source" in group_cols:
+        d["Source"] = d[source_col].astype(str)
+
+    # Build actual grouping columns present in d
+    actual_group_cols = []
+    for key in group_cols:
+        if key == "_day":
+            actual_group_cols.append("_Day")
+        elif key == "Counsellor" and "Counsellor" in d.columns:
+            actual_group_cols.append("Counsellor")
+        elif key in ["Country", "Source"] and key in d.columns:
+            actual_group_cols.append(key)
+
+    rows = []
+
+    if is_day_split:
+        # Only A by day (current month payments)
+        d_cur = d[d["_pay_m"] == cur_period]
+        if not d_cur.empty:
+            g = d_cur.groupby(actual_group_cols).size().reset_index(name="A_Actual_ToDate")
+            for _, r in g.iterrows():
+                row = {col: r[col] for col in actual_group_cols}
+                row["B_Remaining_SameMonth"] = np.nan
+                row["C_Remaining_PrevMonths"] = np.nan
+                row["Projected_MonthEnd_Total"] = np.nan
+                rows.append(row)
+        result = pd.DataFrame(rows)
+        # Rename pretty
+        result = result.rename(columns=rename_map)
+        # Sort by day then others
+        sort_cols = []
+        if "_Day" in result.columns: sort_cols.append("_Day")
+        for k in ["Academic Counsellor","Country","Source"]:
+            if k in result.columns: sort_cols.append(k)
+        if sort_cols:
+            result = result.sort_values(sort_cols).reset_index(drop=True)
+        # Pretty day col
+        if "_Day" in result.columns:
+            result = result.rename(columns={"_Day": "Day (Payment)"})
+        return result
+
+    # Full A/B/C per group (no day)
+    # Iterate distinct combinations to control performance
+    if not actual_group_cols:
+        return pd.DataFrame()
+
+    # Create reduced frame with only needed columns to iterate combos
+    keys_df = d[actual_group_cols].dropna(how="all").drop_duplicates()
+    # Safety cap
+    if len(keys_df) > 500:
+        st.warning("Too many groups (>500). Narrow filters or choose fewer split keys.")
+        keys_df = keys_df.head(500)
+
+    for _, key_row in keys_df.iterrows():
+        cond = pd.Series(True, index=d.index)
+        for col in actual_group_cols:
+            cond &= (d[col].astype(str) == str(key_row[col]))
+        df_subset = df_f.loc[cond.values].copy()
+        if df_subset.empty:
+            continue
+        # Forecast on subset
+        _tbl, totals = predict_running_month(df_subset, create_col, pay_col, source_col,
+                                             lookback=lookback, weighted=weighted, today=today)
+        out = {col: key_row[col] for col in actual_group_cols}
+        out.update({
+            "A_Actual_ToDate": totals["A_Actual_ToDate"],
+            "B_Remaining_SameMonth": totals["B_Remaining_SameMonth"],
+            "C_Remaining_PrevMonths": totals["C_Remaining_PrevMonths"],
+            "Projected_MonthEnd_Total": totals["Projected_MonthEnd_Total"],
+        })
+        rows.append(out)
+
+    result = pd.DataFrame(rows)
+    # Rename pretty for counsellor
+    result = result.rename(columns=rename_map)
+    # Sort
+    sort_cols = []
+    for k in ["Academic Counsellor","Country","Source"]:
+        if k in result.columns: sort_cols.append(k)
+    if sort_cols:
+        result = result.sort_values(sort_cols).reset_index(drop=True)
+    return result
+
 # ----------------------------
 # UI
 # ----------------------------
@@ -706,7 +812,6 @@ with col_ds2:
 
 # --- Load & clean data
 df = load_data(data_src)
-
 dealstage_col = find_col(df, ["Deal Stage", "Deal stage", "Stage", "Deal Status", "Stage Name", "Deal Stage Name"])
 df, _removed = exclude_invalid_deals(df, dealstage_col)
 if dealstage_col:
@@ -739,7 +844,7 @@ yday = today - timedelta(days=1)
 last_m_start, last_m_end = last_month_bounds(today)
 this_m_start, this_m_end = month_bounds(today)
 
-# --- Filters UI
+# --- Filters UI (scope)
 with st.expander("Filters", expanded=True):
     def prep_options(series: pd.Series):
         vals = sorted([str(v) for v in series.dropna().unique()])
@@ -766,47 +871,46 @@ with st.expander("Filters", expanded=True):
         sel_sources = []
         st.info("JetLearn Deal Source column not found. Skipping this filter.")
 
-# Apply filters
+# Apply filters to define scope
 df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellors, sel_countries, sel_sources)
 st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
 
 # ----------------------------
-# MIS
+# MIS (unchanged UI)
 # ----------------------------
+def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict):
+    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Total</div>"
+                    f"<div class='kpi-value'>{pcts['Total']:.1f}%</div>"
+                    f"<div class='kpi-sub'>Den: {denoms.get('Total',0):,} • Num: {nums.get('Total',0):,}</div></div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>AI-Coding</div>"
+                    f"<div class='kpi-value' style='color:{PALETTE['AI Coding']}'>{pcts['AI Coding']:.1f}%</div>"
+                    f"<div class='kpi-sub'>Den: {denoms.get('AI Coding',0):,} • Num: {nums.get('AI Coding',0):,}</div></div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Math</div>"
+                    f"<div class='kpi-value' style='color:{PALETTE['Math']}'>{pcts['Math']:.1f}%</div>"
+                    f"<div class='kpi-sub'>Den: {denoms.get('Math',0):,} • Num: {nums.get('Math',0):,}</div></div>", unsafe_allow_html=True)
+
+    st.altair_chart(bullet_gauge(pcts["Total"], "Total", PALETTE["Total"], nums.get("Total",0), denoms.get("Total",0)), use_container_width=True)
+    st.altair_chart(bullet_gauge(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums.get("AI Coding",0), denoms.get("AI Coding",0)), use_container_width=True)
+    st.altair_chart(bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], nums.get("Math",0), denoms.get("Math",0)), use_container_width=True)
+
 def render_period_block(title: str, range_start: date, range_end: date, running_month_anchor: date):
     st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
-
-    mtd_counts, coh_counts = prepare_counts_for_range(
-        df_f, range_start, range_end, running_month_anchor,
-        create_col, pay_col, pipeline_col
-    )
+    mtd_counts, coh_counts = prepare_counts_for_range(df_f, range_start, range_end, running_month_anchor, create_col, pay_col, pipeline_col)
     c1, c2 = st.columns(2)
     with c1:
-        st.altair_chart(
-            bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"]),
-            use_container_width=True
-        )
+        st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"]), use_container_width=True)
     with c2:
-        st.altair_chart(
-            bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]),
-            use_container_width=True
-        )
-
-    mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
-        df_f, range_start, range_end, create_col, pay_col, pipeline_col,
-        denom_mode="anchor", running_month_anchor=running_month_anchor
-    )
-    st.caption(
-        f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}"
-    )
+        st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
+    mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(df_f, range_start, range_end, create_col, pay_col, pipeline_col, denom_mode="anchor", running_month_anchor=running_month_anchor)
+    st.caption(f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}")
     bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
     bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
-
-    ts = trend_timeseries(
-        df_f, range_start, range_end,
-        denom_mode="anchor", running_month_anchor=running_month_anchor,
-        create_col=create_col, pay_col=pay_col
-    )
+    ts = trend_timeseries(df_f, range_start, range_end, denom_mode="anchor", running_month_anchor=running_month_anchor, create_col=create_col, pay_col=pay_col)
     st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 if view == "MIS":
@@ -869,7 +973,7 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Predictibility (A/B/C via lookback daily rates) + Model Accuracy
+# Predictibility (A/B/C) + Model Accuracy + NEW Break-up table
 # ----------------------------
 if view == "Predictibility":
     st.subheader("Predictibility – Running Month Enrolment Forecast")
@@ -896,10 +1000,10 @@ if view == "Predictibility":
     in_cur_pay = d_preview["_pay_m"] == cur_period
     st.caption(f"Payments found this month (after filters): **{int(in_cur_pay.sum()):,}**")
 
-    # Compute A/B/C
+    # Compute A/B/C overall
     tbl, totals = predict_running_month(df_f, create_col, pay_col, source_col, lookback, weighted, today)
 
-    # Cards
+    # KPI cards
     c1, c2, c3, c4 = st.columns(4)
     with c1:
         st.markdown(f"<div class='kpi-card'><div class='kpi-title'>A · Actual to date</div><div class='kpi-value' style='color:{PALETTE['A_actual']}'>{totals['A_Actual_ToDate']:.1f}</div></div>", unsafe_allow_html=True)
@@ -957,9 +1061,7 @@ if view == "Predictibility":
         unsafe_allow_html=True,
     )
 
-    # Optional detail toggle
     show_details = st.checkbox("Show detailed metrics", value=False)
-
     if show_details:
         m1, m2, m3, m4, m5 = st.columns(5)
         def fmt(x, pct=False):
@@ -982,6 +1084,42 @@ if view == "Predictibility":
                 if show["APE"].notna().any():
                     show["APE%"] = (show["APE"]*100).round(1)
                 st.dataframe(show.drop(columns=["APE"]), use_container_width=True)
+
+    # -------- NEW: Break-up (grouped table) --------
+    st.subheader("Break-up (grouped table)")
+    st.caption("Pick one or more split keys to see A/B/C or day-wise A (actuals).")
+
+    # Build selectable split keys depending on available columns
+    split_options = []
+    key_map = {}  # display -> internal token
+    if counsellor_col: split_options.append("Academic Counsellor"); key_map["Academic Counsellor"] = "Counsellor"
+    if country_col:    split_options.append("Country");             key_map["Country"] = "Country"
+    if source_col:     split_options.append("JetLearn Deal Source");key_map["JetLearn Deal Source"] = "Source"
+    split_options.append("Day (Payment)")                           ;key_map["Day (Payment)"] = "_day"
+
+    chosen = st.multiselect("Group by (choose one or many)", options=split_options, default=[])
+
+    if chosen:
+        # Translate to internal tokens
+        tokens = [key_map[c] for c in chosen]
+        # If Day is included, only A (actuals by payment day)
+        result = predict_running_month_grouped(
+            df_f, tokens, create_col, pay_col, source_col,
+            lookback=lookback, weighted=weighted, today=today
+        )
+        if result.empty:
+            st.info("No rows in scope for the selected grouping.")
+        else:
+            # Round numeric columns nicely
+            for c in ["A_Actual_ToDate","B_Remaining_SameMonth","C_Remaining_PrevMonths","Projected_MonthEnd_Total"]:
+                if c in result.columns:
+                    result[c] = result[c].astype(float).round(2)
+            st.dataframe(result, use_container_width=True)
+            # Download
+            csv = result.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV", data=csv, file_name="breakup_table.csv", mime="text/csv")
+    else:
+        st.info("Choose at least one split key (e.g., Academic Counsellor, Country, Source, or Day).")
 
 # Optional: data preview
 with st.expander("Data preview & column mapping", expanded=False):
