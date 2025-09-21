@@ -273,6 +273,121 @@ df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellor
 st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
 
 # ----------------------------
+# COUNT & CONVERSION LOGIC (restored)
+# ----------------------------
+def prepare_counts_for_range(
+    df: pd.DataFrame,
+    start_d: date,
+    end_d: date,
+    month_for_mtd: date,
+    create_col: str,
+    pay_col: str,
+    pipeline_col: str | None
+):
+    d = df.copy()
+    d["_create_dt"] = coerce_datetime(d[create_col])
+    d["_pay_dt"] = coerce_datetime(d[pay_col])
+
+    in_range_pay = d["_pay_dt"].dt.date.between(start_d, end_d)
+
+    m_start, m_end = month_bounds(month_for_mtd)
+    in_month_create = d["_create_dt"].dt.date.between(m_start, m_end)
+
+    cohort_df = d.loc[in_range_pay]
+    mtd_df = d.loc[in_range_pay & in_month_create]
+
+    if pipeline_col and pipeline_col in d.columns:
+        cohort_split = cohort_df[pipeline_col].map(normalize_pipeline).fillna("Other")
+        mtd_split = mtd_df[pipeline_col].map(normalize_pipeline).fillna("Other")
+    else:
+        cohort_split = pd.Series([], dtype=object)
+        mtd_split = pd.Series([], dtype=object)
+
+    cohort_counts = {
+        "Total": int(len(cohort_df)),
+        "AI Coding": int((pd.Series(cohort_split) == "AI Coding").sum()),
+        "Math": int((pd.Series(cohort_split) == "Math").sum()),
+    }
+    mtd_counts = {
+        "Total": int(len(mtd_df)),
+        "AI Coding": int((pd.Series(mtd_split) == "AI Coding").sum()),
+        "Math": int((pd.Series(mtd_split) == "Math").sum()),
+    }
+    return mtd_counts, cohort_counts
+
+def deals_created_mask_anchor(df: pd.DataFrame, running_month_any_date: date, create_col: str) -> pd.Series:
+    d = df.copy()
+    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
+    m_start, m_end = month_bounds(running_month_any_date)
+    return d["_create_dt"].between(m_start, m_end)
+
+def deals_created_mask_range(df: pd.DataFrame, denom_start: date, denom_end: date, create_col: str) -> pd.Series:
+    d = df.copy()
+    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
+    return d["_create_dt"].between(denom_start, denom_end)
+
+def prepare_conversion_for_range(
+    df: pd.DataFrame,
+    start_d: date,
+    end_d: date,
+    create_col: str,
+    pay_col: str,
+    pipeline_col: str | None,
+    *,
+    denom_mode: str = "anchor",
+    running_month_anchor: date | None = None,
+    denom_start: date | None = None,
+    denom_end: date | None = None
+):
+    d = df.copy()
+    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
+    d["_pay_dt"] = coerce_datetime(d[pay_col]).dt.date
+
+    if denom_mode == "range":
+        if denom_start is None or denom_end is None:
+            zero = {"Total":0.0,"AI Coding":0.0,"Math":0.0}
+            return zero, zero, {"Total":0,"AI Coding":0,"Math":0}, {"mtd": {}, "cohort": {}}
+        denom_mask = deals_created_mask_range(d, denom_start, denom_end, create_col)
+    else:
+        if running_month_anchor is None:
+            zero = {"Total":0.0,"AI Coding":0.0,"Math":0.0}
+            return zero, zero, {"Total":0,"AI Coding":0,"Math":0}, {"mtd": {}, "cohort": {}}
+        denom_mask = deals_created_mask_anchor(d, running_month_anchor, create_col)
+
+    if pipeline_col and pipeline_col in d.columns:
+        pl = d[pipeline_col].map(normalize_pipeline).fillna("Other")
+    else:
+        pl = pd.Series(["Other"] * len(d), index=d.index)
+
+    den_total = int(denom_mask.sum())
+    den_ai    = int((denom_mask & (pl == "AI Coding")).sum())
+    den_math  = int((denom_mask & (pl == "Math")).sum())
+    denoms = {"Total": den_total, "AI Coding": den_ai, "Math": den_math}
+
+    pay_mask = d["_pay_dt"].between(start_d, end_d)
+
+    mtd_mask = pay_mask & denom_mask
+    mtd_total = int(mtd_mask.sum())
+    mtd_ai    = int((mtd_mask & (pl == "AI Coding")).sum())
+    mtd_math  = int((mtd_mask & (pl == "Math")).sum())
+
+    coh_mask = pay_mask
+    coh_total = int(coh_mask.sum())
+    coh_ai    = int((coh_mask & (pl == "AI Coding")).sum())
+    coh_math  = int((coh_mask & (pl == "Math")).sum())
+
+    def pct(n, d):
+        if d == 0:
+            return 0.0
+        return max(0.0, min(100.0, round(100.0 * n / d, 1)))
+
+    mtd_pct = {"Total": pct(mtd_total, den_total), "AI Coding": pct(mtd_ai, den_ai), "Math": pct(mtd_math, den_math)}
+    coh_pct = {"Total": pct(coh_total, den_total), "AI Coding": pct(coh_ai, den_ai), "Math": pct(coh_math, den_math)}
+    numerators = {"mtd": {"Total": mtd_total, "AI Coding": mtd_ai, "Math": mtd_math},
+                  "cohort": {"Total": coh_total, "AI Coding": coh_ai, "Math": coh_math}}
+    return mtd_pct, coh_pct, denoms, numerators
+
+# ----------------------------
 # MIS visuals
 # ----------------------------
 def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, denominator: int,
