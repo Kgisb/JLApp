@@ -167,6 +167,7 @@ if "data_src" not in st.session_state:
 with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio("Go to", ["MIS", "Predictibility"], index=0)
+    track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)  # <-- NEW
     st.caption("Use MIS for status; Predictibility for month-end forecast (A/B/C) & accuracy.")
 
 st.title("📊 JetLearn MIS")
@@ -270,10 +271,20 @@ with st.expander("Filters", expanded=False):  # collapsed by default
 
 # Apply filters to define scope
 df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellors, sel_countries, sel_sources)
+
+# Apply pipeline track filter (AI Coding / Math / Both)
+if track != "Both":
+    if pipeline_col and pipeline_col in df_f.columns:
+        _norm = df_f[pipeline_col].map(normalize_pipeline).fillna("Other")
+        df_f = df_f.loc[_norm == track].copy()
+    else:
+        st.warning("Pipeline column not found — the Track filter can’t be applied.", icon="⚠️")
+
 st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
+st.caption(f"Track filter: **{track}**")
 
 # ----------------------------
-# COUNT & CONVERSION LOGIC (restored)
+# COUNT & CONVERSION LOGIC
 # ----------------------------
 def prepare_counts_for_range(
     df: pd.DataFrame,
