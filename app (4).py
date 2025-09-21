@@ -671,218 +671,6 @@ def accuracy_scatter(bt: pd.DataFrame):
                                    "y":[bt["Actual"].min(), bt["Actual"].max()]})).mark_line()
     return chart + line
 
-# --------- NEW: Grouped break-up with granular A+B+C (incl. day-wise) ---------
-def daily_rates_from_lookback_grouped(d_hist: pd.DataFrame, group_cols: list[str],
-                                      lookback: int, weighted: bool):
-    """
-    Per-day rates for SAME-month (B) and PREV-months (C) by group combination.
-    """
-    if d_hist.empty:
-        return {}, {}, 0.0, 0.0
-
-    months = sorted(d_hist["_pay_m"].unique())
-    months = months[-lookback:] if len(months) > lookback else months
-    d_hist = d_hist[d_hist["_pay_m"].isin(months)].copy()
-
-    if not group_cols:
-        group_cols = []
-
-    gb = d_hist.groupby(["_pay_m"] + group_cols)
-    by = gb["_same_month"].agg(
-        cnt_same=lambda s: int(s.sum()),
-        cnt_prev=lambda s: int((~s).sum())
-    ).reset_index()
-    by["days_in_month"] = by["_pay_m"].apply(month_days)
-
-    month_to_w = {m: (i+1 if weighted else 1.0) for i, m in enumerate(sorted(months))}
-
-    rates_same, rates_prev = {}, {}
-    if not by.empty:
-        by["w"] = by["_pay_m"].map(month_to_w)
-        key_cols = group_cols
-        for key, sub in by.groupby(key_cols):
-            if not isinstance(key, tuple):
-                key = (key,)
-            num_same = (sub["cnt_same"] / sub["days_in_month"] * sub["w"]).sum()
-            num_prev = (sub["cnt_prev"] / sub["days_in_month"] * sub["w"]).sum()
-            den = sub["w"].sum()
-            rates_same[key] = float(num_same / den) if den > 0 else 0.0
-            rates_prev[key] = float(num_prev / den) if den > 0 else 0.0
-
-    # overall fallback
-    all_by = d_hist.groupby("_pay_m")["_same_month"].agg(
-        cnt_same=lambda s: int(s.sum()),
-        cnt_prev=lambda s: int((~s).sum())
-    ).reset_index()
-    all_by["days_in_month"] = all_by["_pay_m"].apply(month_days)
-    w_all = all_by["_pay_m"].map(month_to_w)
-    num_same_o = (all_by["cnt_same"] / all_by["days_in_month"] * w_all).sum()
-    num_prev_o = (all_by["cnt_prev"] / all_by["days_in_month"] * w_all).sum()
-    den_o = w_all.sum()
-    overall_same_rate = float(num_same_o / den_o) if den_o > 0 else 0.0
-    overall_prev_rate = float(num_prev_o / den_o) if den_o > 0 else 0.0
-
-    return rates_same, rates_prev, overall_same_rate, overall_prev_rate
-
-def predict_running_month_grouped(df_f: pd.DataFrame, group_tokens: list[str],
-                                  create_col: str, pay_col: str, source_col: str,
-                                  lookback: int, weighted: bool, today: date):
-    """
-    Grouped A/B/C:
-    - If "_day" in tokens => per-day rows:
-        * days <= today: A = actuals; B=C=0
-        * days >  today: A = 0; B/C = per-day rates from lookback
-    - Else => per-group totals: A to-date + B/C = per-day rates * remaining days
-    """
-    if not group_tokens:
-        return pd.DataFrame()
-
-    d = add_month_cols(df_f.copy(), create_col, pay_col)
-    cur_period = pd.Period(today, freq="M")
-    cur_start, cur_end = month_bounds(today)
-    all_days = list(pd.date_range(cur_start, cur_end, freq="D").date)
-    remaining_days = [dte for dte in all_days if dte > today]
-
-    # map tokens to actual columns in d
-    token_to_col = {}
-    if "Counsellor" in group_tokens and counsellor_col:
-        d["Counsellor"] = d[counsellor_col].astype(str)
-        token_to_col["Counsellor"] = "Counsellor"
-    if "Country" in group_tokens and country_col:
-        d["Country"] = d[country_col].astype(str)
-        token_to_col["Country"] = "Country"
-    if "Source" in group_tokens:
-        if source_col and source_col in d.columns:
-            d["Source"] = d[source_col].astype(str)
-        else:
-            d["Source"] = "All"
-        token_to_col["Source"] = "Source"
-
-    include_day = "_day" in group_tokens
-    if include_day:
-        d["_Day"] = d["_pay_dt"].dt.date
-        token_to_col["_day"] = "_Day"
-
-    # lookback history before current pay month
-    d_hist = d[d["_pay_m"] < cur_period].copy()
-    rate_group_tokens = [t for t in group_tokens if t != "_day"]
-    rate_group_cols = [token_to_col[t] for t in rate_group_tokens if t in token_to_col]
-    rates_same, rates_prev, overall_same_rate, overall_prev_rate = daily_rates_from_lookback_grouped(
-        d_hist, rate_group_cols, lookback=lookback, weighted=weighted
-    )
-
-    rows = []
-
-    if include_day:
-        # A by group+day for current month
-        d_cur = d[d["_pay_m"] == cur_period].copy()
-        group_cols_actual = [token_to_col[t] for t in rate_group_tokens if t in token_to_col] + ["_Day"]
-
-        if not d_cur.empty:
-            gA = d_cur.groupby(group_cols_actual).size().reset_index(name="A")
-            for _, r in gA.iterrows():
-                key_tuple = tuple(r[c] for c in group_cols_actual if c != "_Day")
-                rows.append({
-                    **{c: r[c] for c in group_cols_actual},
-                    "A_Actual_ToDate": float(r["A"]) if r["_Day"] <= today else 0.0,
-                    "B_Remaining_SameMonth": 0.0,
-                    "C_Remaining_PrevMonths": 0.0,
-                    "Projected_MonthEnd_Total": float(r["A"]) if r["_Day"] <= today else 0.0
-                })
-
-        # future days: per-day forecast B/C
-        if rate_group_cols:
-            keys_hist = d[rate_group_cols].dropna(how="all").drop_duplicates()
-        else:
-            keys_hist = pd.DataFrame([{}])
-
-        # safety cap
-        max_rows = 20000
-        if len(keys_hist) * max(1, len(remaining_days)) > max_rows:
-            st.warning("Too many future rows; narrow grouping or filters.")
-            keys_hist = keys_hist.head(max(1, max_rows // max(1, len(remaining_days))))
-
-        for _, key_row in keys_hist.iterrows():
-            key_tuple = tuple(key_row[c] for c in rate_group_cols) if rate_group_cols else tuple()
-            r_same = rates_same.get(key_tuple, overall_same_rate)
-            r_prev = rates_prev.get(key_tuple, overall_prev_rate)
-            for dte in remaining_days:
-                base = {c: key_row[c] for c in rate_group_cols}
-                base["_Day"] = dte
-                b = float(r_same)
-                c = float(r_prev)
-                rows.append({
-                    **base,
-                    "A_Actual_ToDate": 0.0,
-                    "B_Remaining_SameMonth": b,
-                    "C_Remaining_PrevMonths": c,
-                    "Projected_MonthEnd_Total": b + c
-                })
-
-        out = pd.DataFrame(rows)
-        rename_map = {"Counsellor": "Academic Counsellor", "_Day": "Day (Payment)"}
-        out = out.rename(columns=rename_map)
-
-        # fill any missing past days/groups with explicit zeros to make day grid complete (optional)
-        # Round numerics
-        for c in ["A_Actual_ToDate","B_Remaining_SameMonth","C_Remaining_PrevMonths","Projected_MonthEnd_Total"]:
-            if c in out.columns:
-                out[c] = out[c].astype(float).round(2)
-
-        sort_cols = []
-        if "Day (Payment)" in out.columns: sort_cols.append("Day (Payment)")
-        for k in ["Academic Counsellor","Country","Source"]:
-            if k in out.columns: sort_cols.append(k)
-        if sort_cols:
-            out = out.sort_values(sort_cols).reset_index(drop=True)
-        return out
-
-    # ---- no day: per-group totals ----
-    if rate_group_cols:
-        keys_df = d[rate_group_cols].dropna(how="all").drop_duplicates()
-    else:
-        keys_df = pd.DataFrame([{}])
-
-    if len(keys_df) > 1000:
-        st.warning("Too many groups (>1000). Narrow filters or choose fewer split keys.")
-        keys_df = keys_df.head(1000)
-
-    d_cur = d[d["_pay_m"] == cur_period]
-    if rate_group_cols and not d_cur.empty:
-        A_map = d_cur.groupby(rate_group_cols).size().to_dict()
-    else:
-        A_map = {tuple(): float(len(d_cur))} if not d_cur.empty else {tuple(): 0.0}
-
-    for _, key_row in keys_df.iterrows():
-        key_tuple = tuple(key_row[c] for c in rate_group_cols) if rate_group_cols else tuple()
-        r_same = rates_same.get(key_tuple, overall_same_rate)
-        r_prev = rates_prev.get(key_tuple, overall_prev_rate)
-
-        a_val = float(A_map.get(key_tuple, 0.0))
-        b_val = float(r_same * len(remaining_days))
-        c_val = float(r_prev * len(remaining_days))
-
-        out_row = {c: key_row[c] for c in rate_group_cols}
-        out_row.update({
-            "A_Actual_ToDate": a_val,
-            "B_Remaining_SameMonth": b_val,
-            "C_Remaining_PrevMonths": c_val,
-            "Projected_MonthEnd_Total": a_val + b_val + c_val
-        })
-        rows.append(out_row)
-
-    out = pd.DataFrame(rows)
-    out = out.rename(columns={"Counsellor": "Academic Counsellor"})
-    for c in ["A_Actual_ToDate","B_Remaining_SameMonth","C_Remaining_PrevMonths","Projected_MonthEnd_Total"]:
-        if c in out.columns:
-            out[c] = out[c].astype(float).round(2)
-    sort_cols = []
-    for k in ["Academic Counsellor","Country","Source"]:
-        if k in out.columns: sort_cols.append(k)
-    if sort_cols:
-        out = out.sort_values(sort_cols).reset_index(drop=True)
-    return out
-
 # ----------------------------
 # UI
 # ----------------------------
@@ -998,7 +786,7 @@ def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict):
 
     st.altair_chart(bullet_gauge(pcts["Total"], "Total", PALETTE["Total"], nums.get("Total",0), denoms.get("Total",0)), use_container_width=True)
     st.altair_chart(bullet_gauge(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums.get("AI Coding",0), denoms.get("AI Coding",0)), use_container_width=True)
-    st.altair_chart(bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], nums.get("Math",0), denoms.get("Math",0)), use_container_width=True)
+    st.altair_chart(bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], denoms.get("Math",0), denoms.get("Math",0)), use_container_width=True)
 
 def render_period_block(title: str, range_start: date, range_end: date, running_month_anchor: date):
     st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
@@ -1075,7 +863,7 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Predictibility (A/B/C) + Model Accuracy + Break-up table
+# Predictibility (A/B/C) + Model Accuracy   — (granular break-up removed)
 # ----------------------------
 if view == "Predictibility":
     st.subheader("Predictibility – Running Month Enrolment Forecast")
@@ -1119,7 +907,7 @@ if view == "Predictibility":
     # Stacked chart (A + B + C = projection)
     st.altair_chart(predict_chart_stacked(tbl), use_container_width=True)
 
-    with st.expander("Detailed table"):
+    with st.expander("Detailed table (by source)"):
         show_cols = ["Source","A_Actual_ToDate","B_Remaining_SameMonth","C_Remaining_PrevMonths",
                      "Projected_MonthEnd_Total","Rate_Same_Daily","Rate_Prev_Daily","Remaining_Days"]
         if not tbl.empty:
@@ -1127,6 +915,8 @@ if view == "Predictibility":
             for c in ["B_Remaining_SameMonth","C_Remaining_PrevMonths","Projected_MonthEnd_Total","Rate_Same_Daily","Rate_Prev_Daily"]:
                 view_tbl[c] = view_tbl[c].astype(float).round(3)
             st.dataframe(view_tbl, use_container_width=True)
+            csv = view_tbl.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV", data=csv, file_name="predictibility_by_source.csv", mime="text/csv")
         else:
             st.info("No data in scope for the running month after filters.")
 
@@ -1186,35 +976,6 @@ if view == "Predictibility":
                 if show["APE"].notna().any():
                     show["APE%"] = (show["APE"]*100).round(1)
                 st.dataframe(show.drop(columns=["APE"]), use_container_width=True)
-
-    # -------- Break-up (grouped) with granular A+B+C --------
-    st.subheader("Break-up (grouped table)")
-    st.caption("Pick one or more split keys to see **A / B / C** totals — or **day-wise** A/B/C when Day is included.")
-
-    # options
-    split_options = []
-    key_map = {}
-    if counsellor_col: split_options.append("Academic Counsellor"); key_map["Academic Counsellor"] = "Counsellor"
-    if country_col:    split_options.append("Country");             key_map["Country"] = "Country"
-    if source_col:     split_options.append("JetLearn Deal Source");key_map["JetLearn Deal Source"] = "Source"
-    split_options.append("Day (Payment)");                          key_map["Day (Payment)"] = "_day"
-
-    chosen = st.multiselect("Group by (choose one or many)", options=split_options, default=[])
-
-    if chosen:
-        tokens = [key_map[c] for c in chosen]
-        result = predict_running_month_grouped(
-            df_f, tokens, create_col, pay_col, source_col,
-            lookback=lookback, weighted=weighted, today=today
-        )
-        if result.empty:
-            st.info("No rows in scope for the selected grouping.")
-        else:
-            st.dataframe(result, use_container_width=True)
-            csv = result.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV", data=csv, file_name="breakup_table.csv", mime="text/csv")
-    else:
-        st.info("Choose at least one split key (e.g., Academic Counsellor, Country, Source, or Day).")
 
 # Optional: data preview
 with st.expander("Data preview & column mapping", expanded=False):
