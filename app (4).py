@@ -154,272 +154,224 @@ def exclude_invalid_deals(df: pd.DataFrame, dealstage_col: str | None) -> tuple[
     removed = int((~mask_keep).sum())
     return df.loc[mask_keep].copy(), removed
 
-# ---------- COUNT LOGIC (MIS) ----------
-def prepare_counts_for_range(
-    df: pd.DataFrame,
-    start_d: date,
-    end_d: date,
-    month_for_mtd: date,
-    create_col: str,
-    pay_col: str,
-    pipeline_col: str | None
-):
-    df = df.copy()
-    df["_create_dt"] = coerce_datetime(df[create_col])
-    df["_pay_dt"] = coerce_datetime(df[pay_col])
-
-    in_range_pay = df["_pay_dt"].dt.date.between(start_d, end_d)
-    cohort_df = df.loc[in_range_pay]
-
-    m_start, m_end = month_bounds(month_for_mtd)
-    in_month_create = df["_create_dt"].dt.date.between(m_start, m_end)
-    mtd_df = df.loc[in_range_pay & in_month_create]
-
-    if pipeline_col and pipeline_col in df.columns:
-        cohort_split = cohort_df[pipeline_col].map(normalize_pipeline).fillna("Other")
-        mtd_split = mtd_df[pipeline_col].map(normalize_pipeline).fillna("Other")
-    else:
-        cohort_split = pd.Series([], dtype=object)
-        mtd_split = pd.Series([], dtype=object)
-
-    cohort_counts = {
-        "Total": int(len(cohort_df)),
-        "AI Coding": int((pd.Series(cohort_split) == "AI Coding").sum()),
-        "Math": int((pd.Series(cohort_split) == "Math").sum()),
-    }
-    mtd_counts = {
-        "Total": int(len(mtd_df)),
-        "AI Coding": int((pd.Series(mtd_split) == "AI Coding").sum()),
-        "Math": int((pd.Series(mtd_split) == "Math").sum()),
-    }
-    return mtd_counts, cohort_counts
-
-# ---------- CONVERSION% LOGIC (MIS) ----------
-def deals_created_mask_anchor(df: pd.DataFrame, running_month_any_date: date, create_col: str) -> pd.Series:
-    d = df.copy()
-    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
-    m_start, m_end = month_bounds(running_month_any_date)
-    return d["_create_dt"].between(m_start, m_end)
-
-def deals_created_mask_range(df: pd.DataFrame, denom_start: date, denom_end: date, create_col: str) -> pd.Series:
-    d = df.copy()
-    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
-    return d["_create_dt"].between(denom_start, denom_end)
-
-def prepare_conversion_for_range(
-    df: pd.DataFrame,
-    start_d: date,
-    end_d: date,
-    create_col: str,
-    pay_col: str,
-    pipeline_col: str | None,
-    *,
-    denom_mode: str = "anchor",
-    running_month_anchor: date | None = None,
-    denom_start: date | None = None,
-    denom_end: date | None = None
-):
-    d = df.copy()
-    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
-    d["_pay_dt"] = coerce_datetime(d[pay_col]).dt.date
-
-    if denom_mode == "range":
-        if denom_start is None or denom_end is None:
-            zero = {"Total":0.0,"AI Coding":0.0,"Math":0.0}
-            return zero, zero, {"Total":0,"AI Coding":0,"Math":0}, {"mtd": {}, "cohort": {}}
-        denom_mask = deals_created_mask_range(d, denom_start, denom_end, create_col)
-    else:
-        if running_month_anchor is None:
-            zero = {"Total":0.0,"AI Coding":0.0,"Math":0.0}
-            return zero, zero, {"Total":0,"AI Coding":0,"Math":0}, {"mtd": {}, "cohort": {}}
-        denom_mask = deals_created_mask_anchor(d, running_month_anchor, create_col)
-
-    if pipeline_col and pipeline_col in d.columns:
-        pl = d[pipeline_col].map(normalize_pipeline).fillna("Other")
-    else:
-        pl = pd.Series(["Other"] * len(d), index=d.index)
-
-    den_total = int(denom_mask.sum())
-    den_ai    = int((denom_mask & (pl == "AI Coding")).sum())
-    den_math  = int((denom_mask & (pl == "Math")).sum())
-    denoms = {"Total": den_total, "AI Coding": den_ai, "Math": den_math}
-
-    pay_mask = d["_pay_dt"].between(start_d, end_d)
-
-    mtd_mask = pay_mask & denom_mask
-    mtd_total = int(mtd_mask.sum())
-    mtd_ai    = int((mtd_mask & (pl == "AI Coding")).sum())
-    mtd_math  = int((mtd_mask & (pl == "Math")).sum())
-
-    coh_mask = pay_mask
-    coh_total = int(coh_mask.sum())
-    coh_ai    = int((coh_mask & (pl == "AI Coding")).sum())
-    coh_math  = int((coh_mask & (pl == "Math")).sum())
-
-    def pct(n, d):
-        if d == 0:
-            return 0.0
-        return max(0.0, min(100.0, round(100.0 * n / d, 1)))
-
-    mtd_pct = {"Total": pct(mtd_total, den_total), "AI Coding": pct(mtd_ai, den_ai), "Math": pct(mtd_math, den_math)}
-    coh_pct = {"Total": pct(coh_total, den_total), "AI Coding": pct(coh_ai, den_ai), "Math": pct(coh_math, den_math)}
-    numerators = {"mtd": {"Total": mtd_total, "AI Coding": mtd_ai, "Math": mtd_math},
-                  "cohort": {"Total": coh_total, "AI Coding": coh_ai, "Math": coh_math}}
-    return mtd_pct, coh_pct, denoms, numerators
-
-# ---------- MIS visuals ----------
-def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, denominator: int,
-                 thresholds=(10, 20)):
-    p = float(max(0.0, min(100.0, percent)))
-    low, mid = thresholds
-    bg = pd.DataFrame([
-        {"band": "low",  "start": 0,   "end": low},
-        {"band": "mid",  "start": low, "end": mid},
-        {"band": "high", "start": mid, "end": 100},
-    ])
-    fg = pd.DataFrame([{"start": 0, "end": p, "title": title, "percent": f"{p:.1f}%", "num": numerator, "den": denominator}])
-
-    base = alt.Chart(bg).mark_bar(height=18).encode(
-        x=alt.X("start:Q", axis=None, scale=alt.Scale(domain=[0,100])),
-        x2="end:Q",
-        color=alt.Color("band:N", scale=alt.Scale(
-            domain=["low","mid","high"],
-            range=[PALETTE["ThresholdLow"], PALETTE["ThresholdMid"], PALETTE["ThresholdHigh"]]),
-            legend=None),
-    ).properties(height=32, width=360)
-
-    value_bar = alt.Chart(fg).mark_bar(height=18, cornerRadius=4).encode(
-        x=alt.X("start:Q", axis=None, scale=alt.Scale(domain=[0,100])),
-        x2="end:Q",
-        color=alt.value(series_color),
-        tooltip=[
-            alt.Tooltip("title:N", title="Series"),
-            alt.Tooltip("percent:N", title="Conversion %"),
-            alt.Tooltip("num:Q", title="Numerator"),
-            alt.Tooltip("den:Q", title="Denominator"),
-        ],
-    )
-
-    needle = alt.Chart(pd.DataFrame({"val":[p]})).mark_rule(strokeWidth=2).encode(
-        x=alt.X("val:Q", scale=alt.Scale(domain=[0,100])),
-        color=alt.value("#111827"),
-    )
-
-    label_left = alt.Chart(pd.DataFrame({"t":[title]})).mark_text(
-        align="left", baseline="middle", dx=-6, color="#374151", fontSize=12
-    ).encode(text="t:N").properties(width=0)
-
-    label_right = alt.Chart(pd.DataFrame({"p":[f"{p:.1f}%"]})).mark_text(
-        align="left", baseline="middle", dx=8, color="#111827", fontSize=12, fontWeight="bold"
-    ).encode(text="p:N").properties(width=0)
-
-    return alt.hconcat(label_left, (base + value_bar + needle), label_right).resolve_scale(x="shared")
-
-def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
-    data = pd.DataFrame({
-        "Label": ["Total", "AI Coding", "Math"],
-        "Value": [total, ai_cnt, math_cnt],
-        "Row": [0, 1, 1],
-        "Col": [0.5, 0.33, 0.66],
-    })
-    color_domain = ["Total", "AI Coding", "Math"]
-    color_range  = [PALETTE["Total"], PALETTE["AI Coding"], PALETTE["Math"]]
-    base = alt.Chart(data).encode(
-        x=alt.X("Col:Q", axis=None, scale=alt.Scale(domain=(0, 1))),
-        y=alt.Y("Row:Q", axis=None, scale=alt.Scale(domain=(-0.2, 1.2))),
-        tooltip=[alt.Tooltip("Label:N"), alt.Tooltip("Value:Q")],
-    )
-    circles = base.mark_circle(opacity=0.85).encode(
-        size=alt.Size("Value:Q", scale=alt.Scale(range=[400, 8000]), legend=None),
-        color=alt.Color("Label:N", scale=alt.Scale(domain=color_domain, range=color_range), legend=None),
-    )
-    text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text=alt.Text("Value:Q"))
-    return (circles + text).properties(height=360, title=title)
-
-def trend_timeseries(
-    df: pd.DataFrame,
-    payments_start: date,
-    payments_end: date,
-    *,
-    denom_mode: str = "anchor",
-    running_month_anchor: date | None = None,
-    denom_start: date | None = None,
-    denom_end: date | None = None,
-    create_col: str = "",
-    pay_col: str = ""
-):
-    df = df.copy()
-    df["_create_dt"] = coerce_datetime(df[create_col]).dt.date
-    df["_pay_dt"] = coerce_datetime(df[pay_col]).dt.date
-
-    base_start = payments_start
-    base_end = payments_end
-
-    if denom_mode == "range" and denom_start and denom_end:
-        base_start = min(base_start, denom_start)
-        base_end = max(base_end, denom_end)
-        denom_mask = df["_create_dt"].between(denom_start, denom_end)
-    else:
-        if not running_month_anchor:
-            running_month_anchor = payments_start
-        m_start, m_end = month_bounds(running_month_anchor)
-        base_start = min(base_start, m_start)
-        base_end = max(base_end, m_end)
-        denom_mask = df["_create_dt"].between(m_start, m_end)
-
-    all_days = pd.date_range(base_start, base_end, freq="D").date
-
-    leads = (
-        df.loc[denom_mask]
-          .groupby("_create_dt")
-          .size()
-          .reindex(all_days, fill_value=0)
-          .rename("Leads")
-    )
-    pay_mask = df["_pay_dt"].between(payments_start, payments_end)
-    cohort = (
-        df.loc[pay_mask]
-          .groupby("_pay_dt")
-          .size()
-          .reindex(all_days, fill_value=0)
-          .rename("Cohort")
-    )
-    mtd = (
-        df.loc[pay_mask & denom_mask]
-          .groupby("_pay_dt")
-          .size()
-          .reindex(all_days, fill_value=0)
-          .rename("MTD")
-    )
-
-    ts = pd.concat([leads, mtd, cohort], axis=1).fillna(0).reset_index()
-    ts = ts.rename(columns={"index": "Date"})
-    return ts
-
-def trend_chart(ts: pd.DataFrame, title: str):
-    base = alt.Chart(ts).encode(x=alt.X("Date:T", axis=alt.Axis(title=None)))
-
-    bars = base.mark_bar(opacity=0.75).encode(
-        y=alt.Y("Leads:Q", axis=alt.Axis(title="Leads (deals created)")),
-        tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Leads:Q")]
-    ).properties(height=260)
-
-    line_mtd = base.mark_line(point=True).encode(
-        y=alt.Y("MTD:Q", axis=alt.Axis(title="Enrolments"), scale=alt.Scale(zero=True)),
-        color=alt.value(PALETTE["AI Coding"]),
-        tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("MTD:Q", title="MTD Enrolments")]
-    )
-
-    line_coh = base.mark_line(point=True).encode(
-        y=alt.Y("Cohort:Q", axis=alt.Axis(title="Enrolments"), scale=alt.Scale(zero=True)),
-        color=alt.value(PALETTE["Math"]),
-        tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Cohort:Q", title="Cohort Enrolments")]
-    )
-
-    return alt.layer(bars, line_mtd, line_coh).resolve_scale(y='independent').properties(title=title)
+# ----------------------------
+# Session state for data path (default)
+# ----------------------------
+DEFAULT_DATA_PATH = "Master_sheet_DB.csv"
+if "data_src" not in st.session_state:
+    st.session_state["data_src"] = DEFAULT_DATA_PATH
 
 # ----------------------------
-# Predictibility core (A/B/C via lookback daily rates) + Accuracy
+# UI – Sidebar and Header
+# ----------------------------
+with st.sidebar:
+    st.header("JetLearn • Navigation")
+    view = st.radio("Go to", ["MIS", "Predictibility"], index=0)
+    st.caption("Use MIS for status; Predictibility for month-end forecast (A/B/C) & accuracy.")
+
+st.title("📊 JetLearn MIS")
+st.markdown(
+    """
+    <div>
+      <span class="legend-pill pill-ai">AI-Coding</span>
+      <span class="legend-pill pill-math">Math</span>
+      <span class="legend-pill pill-total">Total (Both)</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+st.write("Visualizes **Enrolments (Payments)**, **Conversion%**, **Trend**, and **Predictibility** with **Model Accuracy**.")
+
+# ----------------------------
+# Load & clean data (using the path from session_state)
+# ----------------------------
+data_src = st.session_state["data_src"]
+df = load_data(data_src)
+
+dealstage_col = find_col(df, ["Deal Stage", "Deal stage", "Stage", "Deal Status", "Stage Name", "Deal Stage Name"])
+df, _removed = exclude_invalid_deals(df, dealstage_col)
+if dealstage_col:
+    st.caption(f"Excluded “1.2 Invalid deal(s)”: **{_removed:,}** rows (column: **{dealstage_col}**).")
+else:
+    st.info("Deal Stage column not found — cannot exclude “1.2 Invalid deal(s)”. Check your file.")
+
+create_col = find_col(df, ["Create Date", "Create date", "Create_Date", "Created At"])
+pay_col = find_col(df, ["Payment Received Date", "Payment Received date", "Payment_Received_Date", "Payment Date", "Paid At"])
+pipeline_col = find_col(df, ["Pipeline"])
+
+counsellor_col = find_col(df, ["Student/Academic Counsellor", "Academic Counsellor", "Student/Academic Counselor", "Counsellor", "Counselor"])
+country_col = find_col(df, ["Country"])
+source_col = find_col(df, ["JetLearn Deal Source", "Deal Source", "Source"])
+
+if not create_col or not pay_col:
+    st.error("Could not find required date columns. Need 'Create Date' and 'Payment Received Date' (or close variants).")
+    st.stop()
+
+# Drop rows with missing/invalid Create Date
+tmp_create = coerce_datetime(df[create_col])
+missing_create = int(tmp_create.isna().sum())
+if missing_create > 0:
+    df = df.loc[tmp_create.notna()].copy()
+    st.caption(f"Removed rows with missing/invalid **Create Date**: **{missing_create:,}**")
+
+# --- Period presets
+today = date.today()
+yday = today - timedelta(days=1)
+last_m_start, last_m_end = last_month_bounds(today)
+this_m_start, this_m_end = month_bounds(today)
+
+# ----------------------------
+# Filters (kept CLOSED by default) + Data path at bottom-left inside the expander
+# ----------------------------
+def _update_data_src():
+    st.session_state["data_src"] = st.session_state.get("data_src_input", DEFAULT_DATA_PATH)
+    st.rerun()
+
+with st.expander("Filters", expanded=False):  # always closed
+    def prep_options(series: pd.Series):
+        vals = sorted([str(v) for v in series.dropna().unique()])
+        return ["All"] + vals
+
+    # Filters body
+    if counsellor_col:
+        counsellor_opts = prep_options(df[counsellor_col])
+        sel_counsellors = st.multiselect("Academic Counsellor", options=counsellor_opts, default=["All"])
+    else:
+        sel_counsellors = []
+        st.info("Academic Counsellor column not found. Skipping this filter.")
+
+    if country_col:
+        country_opts = prep_options(df[country_col])
+        sel_countries = st.multiselect("Country", options=country_opts, default=["All"])
+    else:
+        sel_countries = []
+        st.info("Country column not found. Skipping this filter.")
+
+    if source_col:
+        source_opts = prep_options(df[source_col])
+        sel_sources = st.multiselect("JetLearn Deal Source", options=source_opts, default=["All"])
+    else:
+        sel_sources = []
+        st.info("JetLearn Deal Source column not found. Skipping this filter.")
+
+    st.caption("Auto-excludes ‘1.2 Invalid deal(s)’ • Drops rows with missing **Create Date**")
+
+    # --- Bottom row inside expander: place Data file path (LEFT column)
+    col_bottom_left, col_bottom_right = st.columns([3, 2])
+    with col_bottom_left:
+        st.text_input(
+            "Data file path",
+            key="data_src_input",
+            value=st.session_state.get("data_src", DEFAULT_DATA_PATH),
+            help="CSV path (pre-uploaded in the repo).",
+            on_change=_update_data_src,
+        )
+    with col_bottom_right:
+        st.empty()
+
+# Apply filters to define scope
+df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellors, sel_countries, sel_sources)
+st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
+
+# ----------------------------
+# MIS
+# ----------------------------
+def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict):
+    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Total</div>"
+                    f"<div class='kpi-value'>{pcts['Total']:.1f}%</div>"
+                    f"<div class='kpi-sub'>Den: {denoms.get('Total',0):,} • Num: {nums.get('Total',0):,}</div></div>", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>AI-Coding</div>"
+                    f"<div class='kpi-value' style='color:{PALETTE['AI Coding']}'>{pcts['AI Coding']:.1f}%</div>"
+                    f"<div class='kpi-sub'>Den: {denoms.get('AI Coding',0):,} • Num: {nums.get('AI Coding',0):,}</div></div>", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Math</div>"
+                    f"<div class='kpi-value' style='color:{PALETTE['Math']}'>{pcts['Math']:.1f}%</div>"
+                    f"<div class='kpi-sub'>Den: {denoms.get('Math',0):,} • Num: {nums.get('Math',0):,}</div></div>", unsafe_allow_html=True)
+
+    st.altair_chart(bullet_gauge(pcts["Total"], "Total", PALETTE["Total"], nums.get("Total",0), denoms.get("Total",0)), use_container_width=True)
+    st.altair_chart(bullet_gauge(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums.get("AI Coding",0), denoms.get("AI Coding",0)), use_container_width=True)
+    st.altair_chart(bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], nums.get("Math",0), denoms.get("Math",0)), use_container_width=True)
+
+def render_period_block(title: str, range_start: date, range_end: date, running_month_anchor: date):
+    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
+    mtd_counts, coh_counts = prepare_counts_for_range(df_f, range_start, range_end, running_month_anchor, create_col, pay_col, pipeline_col)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"]), use_container_width=True)
+    with c2:
+        st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
+    mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(df_f, range_start, range_end, create_col, pay_col, pipeline_col, denom_mode="anchor", running_month_anchor=running_month_anchor)
+    st.caption(f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}")
+    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
+    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
+    ts = trend_timeseries(df_f, range_start, range_end, denom_mode="anchor", running_month_anchor=running_month_anchor, create_col=create_col, pay_col=pay_col)
+    st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
+
+if view == "MIS":
+    show_all = st.checkbox("Show all preset periods (Yesterday • Today • Last Month • This Month)", value=False)
+    if show_all:
+        st.subheader("Preset Periods")
+        colA, colB = st.columns(2)
+        with colA:
+            render_period_block("Yesterday", yday, yday, yday)
+            st.divider()
+            render_period_block("Last Month", last_m_start, last_m_end, last_m_start)
+        with colB:
+            render_period_block("Today", today, today, today)
+            st.divider()
+            render_period_block("This Month", this_m_start, this_m_end, this_m_start)
+    else:
+        tabs = st.tabs(["Yesterday", "Today", "Last Month", "This Month", "Custom"])
+        with tabs[0]: render_period_block("Yesterday", yday, yday, yday)
+        with tabs[1]: render_period_block("Today", today, today, today)
+        with tabs[2]: render_period_block("Last Month", last_m_start, last_m_end, last_m_start)
+        with tabs[3]: render_period_block("This Month", this_m_start, this_m_end, this_m_start)
+        with tabs[4]:
+            st.markdown("Select a **payments period** and choose the **Conversion% denominator** mode.")
+            colc1, colc2 = st.columns(2)
+            with colc1: custom_start = st.date_input("Payments period start", value=this_m_start)
+            with colc2: custom_end   = st.date_input("Payments period end (inclusive)", value=this_m_end)
+            if custom_end < custom_start:
+                st.error("Payments period end cannot be before start.")
+            else:
+                denom_mode = st.radio("Denominator for Conversion%", ["Anchor month", "Custom range"], index=0, horizontal=True)
+                if denom_mode == "Anchor month":
+                    anchor = st.date_input("Running-month anchor (denominator month)", value=custom_start)
+                    mtd_counts, coh_counts = prepare_counts_for_range(df_f, custom_start, custom_end, anchor, create_col, pay_col, pipeline_col)
+                    c1, c2 = st.columns(2)
+                    with c1: st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"]), use_container_width=True)
+                    with c2: st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
+                    mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(df_f, custom_start, custom_end, create_col, pay_col, pipeline_col, denom_mode="anchor", running_month_anchor=anchor)
+                    st.caption(f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}")
+                    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
+                    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
+                    ts = trend_timeseries(df_f, custom_start, custom_end, denom_mode="anchor", running_month_anchor=anchor, create_col=create_col, pay_col=pay_col)
+                    st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
+                else:
+                    cold1, cold2 = st.columns(2)
+                    with cold1: denom_start = st.date_input("Denominator start (deals created from)", value=custom_start, key="denom_start")
+                    with cold2: denom_end   = st.date_input("Denominator end (deals created to)",   value=custom_end,   key="denom_end")
+                    if denom_end < denom_start:
+                        st.error("Denominator end cannot be before start.")
+                    else:
+                        anchor_for_counts = custom_start
+                        mtd_counts, coh_counts = prepare_counts_for_range(df_f, custom_start, custom_end, anchor_for_counts, create_col, pay_col, pipeline_col)
+                        c1, c2 = st.columns(2)
+                        with c1: st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"]), use_container_width=True)
+                        with c2: st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
+                        mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(df_f, custom_start, custom_end, create_col, pay_col, pipeline_col, denom_mode="range", denom_start=denom_start, denom_end=denom_end)
+                        st.caption(f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}")
+                        bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
+                        bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
+                        ts = trend_timeseries(df_f, custom_start, custom_end, denom_mode="range", denom_start=denom_start, denom_end=denom_end, create_col=create_col, pay_col=pay_col)
+                        st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
+
+# ----------------------------
+# Predictibility (A/B/C) + Model Accuracy (tied to lookback)
 # ----------------------------
 def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFrame:
     d = df.copy()
@@ -667,199 +619,9 @@ def accuracy_scatter(bt: pd.DataFrame):
         y=alt.Y("Forecast:Q", title="Forecast (start-of-month)"),
         tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Actual:Q"), alt.Tooltip("Forecast:Q"), alt.Tooltip("Error:Q")],
     ).properties(height=360, title="Forecast vs Actual (by month)")
-    line = alt.Chart(pd.DataFrame({"x":[bt["Actual"].min(), bt["Actual"].max()],"y":[bt["Actual"].min(), bt["Actual"].max()]})).mark_line()
+    line = alt.Chart(pd.DataFrame({"x":[bt["Actual"].min(), bt["Actual"].max()],
+                                   "y":[bt["Actual"].min(), bt["Actual"].max()]})).mark_line()
     return chart + line
-
-# ----------------------------
-# UI
-# ----------------------------
-with st.sidebar:
-    st.header("JetLearn • Navigation")
-    view = st.radio("Go to", ["MIS", "Predictibility"], index=0)
-    st.caption("Use MIS for status; Predictibility for month-end forecast (A/B/C) & accuracy.")
-
-st.title("📊 JetLearn MIS")
-st.markdown(
-    """
-    <div>
-      <span class="legend-pill pill-ai">AI-Coding</span>
-      <span class="legend-pill pill-math">Math</span>
-      <span class="legend-pill pill-total">Total (Both)</span>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-st.write("Visualizes **Enrolments (Payments)**, **Conversion%**, **Trend**, and **Predictibility** with **Model Accuracy**.")
-
-# --- Data source
-col_ds1, col_ds2 = st.columns([3, 2])
-with col_ds1:
-    default_path = "Master_sheet_DB.csv"
-    data_src = st.text_input("Data file path", value=default_path, help="CSV path (pre-uploaded in the repo).")
-with col_ds2:
-    st.caption("Auto-excludes ‘1.2 Invalid deal(s)’ • Drops rows with missing **Create Date**")
-
-# --- Load & clean data
-df = load_data(data_src)
-dealstage_col = find_col(df, ["Deal Stage", "Deal stage", "Stage", "Deal Status", "Stage Name", "Deal Stage Name"])
-df, _removed = exclude_invalid_deals(df, dealstage_col)
-if dealstage_col:
-    st.caption(f"Excluded “1.2 Invalid deal(s)”: **{_removed:,}** rows (column: **{dealstage_col}**).")
-else:
-    st.info("Deal Stage column not found — cannot exclude “1.2 Invalid deal(s)”. Check your file.")
-
-create_col = find_col(df, ["Create Date", "Create date", "Create_Date", "Created At"])
-pay_col = find_col(df, ["Payment Received Date", "Payment Received date", "Payment_Received_Date", "Payment Date", "Paid At"])
-pipeline_col = find_col(df, ["Pipeline"])
-
-counsellor_col = find_col(df, ["Student/Academic Counsellor", "Academic Counsellor", "Student/Academic Counselor", "Counsellor", "Counselor"])
-country_col = find_col(df, ["Country"])
-source_col = find_col(df, ["JetLearn Deal Source", "Deal Source", "Source"])
-
-if not create_col or not pay_col:
-    st.error("Could not find required date columns. Need 'Create Date' and 'Payment Received Date' (or close variants).")
-    st.stop()
-
-# Drop rows with missing/invalid Create Date
-tmp_create = coerce_datetime(df[create_col])
-missing_create = int(tmp_create.isna().sum())
-if missing_create > 0:
-    df = df.loc[tmp_create.notna()].copy()
-    st.caption(f"Removed rows with missing/invalid **Create Date**: **{missing_create:,}**")
-
-# --- Period presets
-today = date.today()
-yday = today - timedelta(days=1)
-last_m_start, last_m_end = last_month_bounds(today)
-this_m_start, this_m_end = month_bounds(today)
-
-# --- Filters UI (scope)
-with st.expander("Filters", expanded=True):
-    def prep_options(series: pd.Series):
-        vals = sorted([str(v) for v in series.dropna().unique()])
-        return ["All"] + vals
-
-    if counsellor_col:
-        counsellor_opts = prep_options(df[counsellor_col])
-        sel_counsellors = st.multiselect("Academic Counsellor", options=counsellor_opts, default=["All"])
-    else:
-        sel_counsellors = []
-        st.info("Academic Counsellor column not found. Skipping this filter.")
-
-    if country_col:
-        country_opts = prep_options(df[country_col])
-        sel_countries = st.multiselect("Country", options=country_opts, default=["All"])
-    else:
-        sel_countries = []
-        st.info("Country column not found. Skipping this filter.")
-
-    if source_col:
-        source_opts = prep_options(df[source_col])
-        sel_sources = st.multiselect("JetLearn Deal Source", options=source_opts, default=["All"])
-    else:
-        sel_sources = []
-        st.info("JetLearn Deal Source column not found. Skipping this filter.")
-
-# Apply filters to define scope
-df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellors, sel_countries, sel_sources)
-st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
-
-# ----------------------------
-# MIS
-# ----------------------------
-def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict):
-    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Total</div>"
-                    f"<div class='kpi-value'>{pcts['Total']:.1f}%</div>"
-                    f"<div class='kpi-sub'>Den: {denoms.get('Total',0):,} • Num: {nums.get('Total',0):,}</div></div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>AI-Coding</div>"
-                    f"<div class='kpi-value' style='color:{PALETTE['AI Coding']}'>{pcts['AI Coding']:.1f}%</div>"
-                    f"<div class='kpi-sub'>Den: {denoms.get('AI Coding',0):,} • Num: {nums.get('AI Coding',0):,}</div></div>", unsafe_allow_html=True)
-    with c3:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Math</div>"
-                    f"<div class='kpi-value' style='color:{PALETTE['Math']}'>{pcts['Math']:.1f}%</div>"
-                    f"<div class='kpi-sub'>Den: {denoms.get('Math',0):,} • Num: {nums.get('Math',0):,}</div></div>", unsafe_allow_html=True)
-
-    st.altair_chart(bullet_gauge(pcts["Total"], "Total", PALETTE["Total"], nums.get("Total",0), denoms.get("Total",0)), use_container_width=True)
-    st.altair_chart(bullet_gauge(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums.get("AI Coding",0), denoms.get("AI Coding",0)), use_container_width=True)
-    st.altair_chart(bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], nums.get("Math",0), denoms.get("Math",0)), use_container_width=True)
-
-def render_period_block(title: str, range_start: date, range_end: date, running_month_anchor: date):
-    st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
-    mtd_counts, coh_counts = prepare_counts_for_range(df_f, range_start, range_end, running_month_anchor, create_col, pay_col, pipeline_col)
-    c1, c2 = st.columns(2)
-    with c1:
-        st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"]), use_container_width=True)
-    with c2:
-        st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
-    mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(df_f, range_start, range_end, create_col, pay_col, pipeline_col, denom_mode="anchor", running_month_anchor=running_month_anchor)
-    st.caption(f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}")
-    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
-    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
-    ts = trend_timeseries(df_f, range_start, range_end, denom_mode="anchor", running_month_anchor=running_month_anchor, create_col=create_col, pay_col=pay_col)
-    st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
-
-if view == "MIS":
-    show_all = st.checkbox("Show all preset periods (Yesterday • Today • Last Month • This Month)", value=False)
-    if show_all:
-        st.subheader("Preset Periods")
-        colA, colB = st.columns(2)
-        with colA:
-            render_period_block("Yesterday", yday, yday, yday)
-            st.divider()
-            render_period_block("Last Month", last_m_start, last_m_end, last_m_start)
-        with colB:
-            render_period_block("Today", today, today, today)
-            st.divider()
-            render_period_block("This Month", this_m_start, this_m_end, this_m_start)
-    else:
-        tabs = st.tabs(["Yesterday", "Today", "Last Month", "This Month", "Custom"])
-        with tabs[0]: render_period_block("Yesterday", yday, yday, yday)
-        with tabs[1]: render_period_block("Today", today, today, today)
-        with tabs[2]: render_period_block("Last Month", last_m_start, last_m_end, last_m_start)
-        with tabs[3]: render_period_block("This Month", this_m_start, this_m_end, this_m_start)
-        with tabs[4]:
-            st.markdown("Select a **payments period** and choose the **Conversion% denominator** mode.")
-            colc1, colc2 = st.columns(2)
-            with colc1: custom_start = st.date_input("Payments period start", value=this_m_start)
-            with colc2: custom_end   = st.date_input("Payments period end (inclusive)", value=this_m_end)
-            if custom_end < custom_start:
-                st.error("Payments period end cannot be before start.")
-            else:
-                denom_mode = st.radio("Denominator for Conversion%", ["Anchor month", "Custom range"], index=0, horizontal=True)
-                if denom_mode == "Anchor month":
-                    anchor = st.date_input("Running-month anchor (denominator month)", value=custom_start)
-                    mtd_counts, coh_counts = prepare_counts_for_range(df_f, custom_start, custom_end, anchor, create_col, pay_col, pipeline_col)
-                    c1, c2 = st.columns(2)
-                    with c1: st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"]), use_container_width=True)
-                    with c2: st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
-                    mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(df_f, custom_start, custom_end, create_col, pay_col, pipeline_col, denom_mode="anchor", running_month_anchor=anchor)
-                    st.caption(f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}")
-                    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
-                    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
-                    ts = trend_timeseries(df_f, custom_start, custom_end, denom_mode="anchor", running_month_anchor=anchor, create_col=create_col, pay_col=pay_col)
-                    st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
-                else:
-                    cold1, cold2 = st.columns(2)
-                    with cold1: denom_start = st.date_input("Denominator start (deals created from)", value=custom_start, key="denom_start")
-                    with cold2: denom_end   = st.date_input("Denominator end (deals created to)",   value=custom_end,   key="denom_end")
-                    if denom_end < denom_start:
-                        st.error("Denominator end cannot be before start.")
-                    else:
-                        anchor_for_counts = custom_start
-                        mtd_counts, coh_counts = prepare_counts_for_range(df_f, custom_start, custom_end, anchor_for_counts, create_col, pay_col, pipeline_col)
-                        c1, c2 = st.columns(2)
-                        with c1: st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"]), use_container_width=True)
-                        with c2: st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"]), use_container_width=True)
-                        mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(df_f, custom_start, custom_end, create_col, pay_col, pipeline_col, denom_mode="range", denom_start=denom_start, denom_end=denom_end)
-                        st.caption(f"Denominators — Total: {denoms['Total']:,} • AI-Coding: {denoms['AI Coding']:,} • Math: {denoms['Math']:,}")
-                        bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms)
-                        bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms)
-                        ts = trend_timeseries(df_f, custom_start, custom_end, denom_mode="range", denom_start=denom_start, denom_end=denom_end, create_col=create_col, pay_col=pay_col)
-                        st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
 # Predictibility (A/B/C) + Model Accuracy (tied to lookback)
@@ -877,7 +639,6 @@ if view == "Predictibility":
     with colp1:
         lookback = st.selectbox("Lookback window (months)", [3, 6, 12], index=0)
     with colp2:
-        # Fixed to Recency-weighted (simple average removed)
         st.markdown("**Averaging:** Recency-weighted")
         st.caption("Uses weights 1..K across the last K pay-months (most recent has highest weight).")
         weighted = True
@@ -928,7 +689,7 @@ if view == "Predictibility":
     bt, metrics = backtest_accuracy(
         df_f, create_col, pay_col, source_col,
         lookback=lookback, weighted=weighted,
-        backtest_months=lookback,  # tie accuracy window to lookback
+        backtest_months=lookback,
         today=today
     )
 
