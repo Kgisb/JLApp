@@ -4,7 +4,8 @@ import numpy as np
 import altair as alt
 from datetime import datetime, date, timedelta
 import math
-import re  # NEW
+import re
+from calendar import monthrange
 
 st.set_page_config(
     page_title="JetLearn MIS – Enrolments (MTD & Cohort) + Conversion%",
@@ -58,12 +59,15 @@ st.markdown(
 
 # ---------- Color palette ----------
 PALETTE = {
-    "Total": "#6b7280",
-    "AI Coding": "#2563eb",
-    "Math": "#16a34a",
+    "Total": "#6b7280",      # gray-500
+    "AI Coding": "#2563eb",  # blue-600
+    "Math": "#16a34a",       # green-600
     "ThresholdLow": "#f3f4f6",
     "ThresholdMid": "#e5e7eb",
     "ThresholdHigh": "#d1d5db",
+    "A_actual_same": "#2563eb",   # reuse blue
+    "B_fore_prev":   "#6b7280",   # gray
+    "C_fore_same":   "#16a34a",   # green
 }
 
 # ----------------------------
@@ -100,9 +104,9 @@ def coerce_datetime(series: pd.Series) -> pd.Series:
 def month_bounds(d: date):
     start = date(d.year, d.month, 1)
     if d.month == 12:
-        end = date(d.year + 1, 1, 1) - timedelta(days=1)
+        end = date(d.year, 12, 31)
     else:
-        end = date(d.year, d.month + 1, 1) - timedelta(days=1)
+        end = date(d.year, d.month, monthrange(d.year, d.month)[1])
     return start, end
 
 def last_month_bounds(today: date):
@@ -138,11 +142,10 @@ def apply_filters(
         f = f[f[source_col].astype(str).isin(sel_sources)]
     return f
 
-# NEW: strict, always-on exclusion for Invalid Deals
+# ---------- Always-on exclusion for Invalid Deals ----------
 INVALID_RE = re.compile(r"^\s*1\.2\s*invalid\s*deal[s]?\s*$", flags=re.IGNORECASE)
 
 def exclude_invalid_deals(df: pd.DataFrame, dealstage_col: str | None) -> tuple[pd.DataFrame, int]:
-    """Return (filtered_df, removed_count). If column missing, returns original df, 0."""
     if not dealstage_col:
         return df, 0
     col = df[dealstage_col].astype(str)
@@ -263,7 +266,7 @@ def prepare_conversion_for_range(
                   "cohort": {"Total": coh_total, "AI Coding": coh_ai, "Math": coh_math}}
     return mtd_pct, coh_pct, denoms, numerators
 
-# ---------- BULLET GAUGE ----------
+# ---------- MIS visual bits ----------
 def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, denominator: int,
                  thresholds=(10, 20)):
     p = float(max(0.0, min(100.0, percent)))
@@ -331,7 +334,6 @@ def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict):
     st.altair_chart(bullet_gauge(pcts["AI Coding"], "AI-Coding", PALETTE["AI Coding"], nums.get("AI Coding",0), denoms.get("AI Coding",0)), use_container_width=True)
     st.altair_chart(bullet_gauge(pcts["Math"], "Math", PALETTE["Math"], nums.get("Math",0), denoms.get("Math",0)), use_container_width=True)
 
-# ---------- BUBBLES FOR COUNTS ----------
 def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
     data = pd.DataFrame({
         "Label": ["Total", "AI Coding", "Math"],
@@ -353,7 +355,6 @@ def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int):
     text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text=alt.Text("Value:Q"))
     return (circles + text).properties(height=360, title=title)
 
-# ---------- TREND ----------
 def trend_timeseries(
     df: pd.DataFrame,
     payments_start: date,
@@ -363,8 +364,8 @@ def trend_timeseries(
     running_month_anchor: date | None = None,
     denom_start: date | None = None,
     denom_end: date | None = None,
-    create_col: str,
-    pay_col: str
+    create_col: str = "",
+    pay_col: str = ""
 ):
     df = df.copy()
     df["_create_dt"] = coerce_datetime(df[create_col]).dt.date
@@ -437,12 +438,232 @@ def trend_chart(ts: pd.DataFrame, title: str):
     return alt.layer(bars, line_mtd, line_coh).resolve_scale(y='independent').properties(title=title)
 
 # ----------------------------
+# PREDICTIBILITY core
+# ----------------------------
+def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFrame:
+    d = df.copy()
+    d["_create_dt"] = coerce_datetime(d[create_col])
+    d["_pay_dt"]    = coerce_datetime(d[pay_col])
+    d["_create_m"]  = d["_create_dt"].dt.to_period("M")
+    d["_pay_m"]     = d["_pay_dt"].dt.to_period("M")
+    d["_same_month"] = (d["_create_m"] == d["_pay_m"])
+    return d
+
+def month_iter(end_month: pd.Period, back: int):
+    # yields most-recent first, excluding end_month itself
+    for i in range(1, back+1):
+        yield end_month - i
+
+def source_wavg_shares(d_hist: pd.DataFrame, source_col: str, lookback: int, weighted: bool):
+    """
+    Compute per-source weighted-average shares for:
+      same_share: share of month’s enrolments whose create-month == pay-month
+      prev_share: 1 - same_share
+    over 'lookback' months prior to current month.
+    """
+    if d_hist.empty:
+        return {}, 0.0, 0.0
+
+    # Build month -> weights
+    months = sorted(d_hist["_pay_m"].unique())
+    # Keep last 'lookback' months only
+    if len(months) > lookback:
+        months = months[-lookback:]
+
+    weights = {}
+    if weighted:
+        # Recency weights 1..k for oldest..newest among the months we’re using
+        k = len(months)
+        for idx, m in enumerate(months, start=1):
+            weights[m] = idx  # linear recency
+    else:
+        for m in months:
+            weights[m] = 1.0
+
+    # precompute per (source, month): same_count and total_count
+    shares = {}
+    for m in months:
+        sub = d_hist[d_hist["_pay_m"] == m]
+        if sub.empty:
+            continue
+        by_src = sub.groupby(source_col).agg(
+            same_cnt=("_same_month", "sum"),
+            total=(" _same_month".strip(), "count")  # trick to use a constant existing col
+        ).reset_index()
+        # Alt method: total = group size
+        by_src = sub.groupby(source_col).size().to_frame("total").join(
+            sub[sub["_same_month"]].groupby(source_col).size().to_frame("same_cnt"),
+            how="left"
+        ).fillna(0).reset_index()
+
+        for _, row in by_src.iterrows():
+            src = str(row[source_col])
+            same_share_m = (row["same_cnt"] / row["total"]) if row["total"] > 0 else 0.0
+            shares.setdefault(src, []).append((m, same_share_m))
+
+    # Aggregate weighted average
+    result_same = {}
+    for src, lst in shares.items():
+        num = 0.0
+        den = 0.0
+        for m, s in lst:
+            w = weights.get(m, 0.0)
+            num += w * s
+            den += w
+        result_same[src] = (num/den) if den > 0 else 0.0
+
+    # Overall fallback (across all sources)
+    # Compute overall same_share per month, then weighted-avg
+    overall_same_by_m = {}
+    for m in months:
+        sub = d_hist[d_hist["_pay_m"] == m]
+        tot = len(sub)
+        same = int(sub["_same_month"].sum())
+        overall_same_by_m[m] = (same / tot) if tot > 0 else 0.0
+    num = sum(overall_same_by_m[m] * weights[m] for m in months)
+    den = sum(weights[m] for m in months)
+    overall_same = (num/den) if den > 0 else 0.5  # neutral fallback
+
+    # Convert to prev shares
+    result_prev = {k: max(0.0, min(1.0, 1.0 - v)) for k, v in result_same.items()}
+    overall_prev = max(0.0, min(1.0, 1.0 - overall_same))
+    return (result_same, result_prev, overall_same, overall_prev)
+
+def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
+                          lookback: int, weighted: bool, today: date):
+    """Returns (table_df, totals_dict) with columns:
+       Source, A_Actual_Same, B_Remaining_From_Prev, C_Remaining_From_Same,
+       Projected_MonthEnd_Total, WAvg_Same_Share, WAvg_Prev_Share
+    """
+    if source_col is None or source_col not in df_f.columns:
+        # fabricate a source column = "All"
+        df_work = df_f.copy()
+        source_col = "_Source"
+        df_work[source_col] = "All"
+    else:
+        df_work = df_f.copy()
+
+    d = add_month_cols(df_work, create_col, pay_col)
+
+    # Current month range
+    cur_start, cur_end = month_bounds(today)
+    cur_period = pd.Period(cur_start, freq="M")
+
+    in_cur_pay = d["_pay_dt"].dt.date.between(cur_start, cur_end)
+    d_cur = d.loc[in_cur_pay].copy()
+
+    # Realized so far (split by whether created in current month)
+    realized_by_src = d_cur.groupby(source_col).apply(
+        lambda x: pd.Series({
+            "realized_total": len(x),
+            "realized_same": int((x["_same_month"]).sum()),
+            "realized_prev": int((~x["_same_month"]).sum()),
+        })
+    ).reset_index()
+
+    # Historical months (exclude current)
+    d_hist = d[d["_pay_m"] < cur_period].copy()
+    # Keep only months present in lookback
+    if not d_hist.empty:
+        last_month = d_hist["_pay_m"].max()
+        months_keep = list(month_iter(cur_period, lookback))
+        d_hist = d_hist[d_hist["_pay_m"].isin(months_keep)]
+
+    # Shares by source
+    same_shares, prev_shares, overall_same, overall_prev = source_wavg_shares(d_hist, source_col, lookback, weighted)
+
+    # MTD pace → project month-end totals per source
+    elapsed_days = (today - cur_start).days + 1
+    total_days = (cur_end - cur_start).days + 1
+
+    by_src = realized_by_src.set_index(source_col)
+    all_sources = sorted(d_cur[source_col].dropna().unique().tolist())
+    # Include sources appearing historically but not yet this month
+    all_sources = sorted(set(all_sources) | set(same_shares.keys()) | set(prev_shares.keys()))
+
+    rows = []
+    tot_A = tot_B = tot_C = 0.0
+    for src in all_sources:
+        r = by_src.loc[src] if src in by_src.index else pd.Series({"realized_total":0, "realized_same":0, "realized_prev":0})
+        realized_total = int(r["realized_total"])
+        realized_same = int(r["realized_same"])
+        realized_prev = int(r["realized_prev"])
+
+        # pace
+        per_day = realized_total / elapsed_days if elapsed_days > 0 else 0.0
+        projected_total = per_day * total_days
+
+        # shares
+        same_share = same_shares.get(src, overall_same)
+        prev_share = prev_shares.get(src, overall_prev)
+
+        # expected month-end components
+        exp_same_total = projected_total * same_share
+        exp_prev_total = projected_total * prev_share
+
+        # remaining forecasts
+        rem_from_same = max(0.0, exp_same_total - realized_same)
+        rem_from_prev = max(0.0, exp_prev_total - realized_prev)
+
+        rows.append({
+            "Source": src,
+            "A_Actual_Same": realized_same,
+            "B_Remaining_From_Prev": rem_from_prev,
+            "C_Remaining_From_Same": rem_from_same,
+            "Projected_MonthEnd_Total": projected_total,
+            "WAvg_Same_Share": same_share,
+            "WAvg_Prev_Share": prev_share,
+        })
+
+        tot_A += realized_same
+        tot_B += rem_from_prev
+        tot_C += rem_from_same
+
+    tbl = pd.DataFrame(rows).sort_values("Source").reset_index(drop=True)
+
+    totals = {
+        "A_Actual_Same": tot_A,
+        "B_Remaining_From_Prev": tot_B,
+        "C_Remaining_From_Same": tot_C,
+        "Projected_MonthEnd_Total": tbl["Projected_MonthEnd_Total"].sum() if not tbl.empty else 0.0
+    }
+    return tbl, totals
+
+def predict_chart(tbl: pd.DataFrame):
+    if tbl.empty:
+        return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
+    melt = tbl.melt(
+        id_vars=["Source"],
+        value_vars=["A_Actual_Same","B_Remaining_From_Prev","C_Remaining_From_Same"],
+        var_name="Component",
+        value_name="Value"
+    )
+    color_map = {
+        "A_Actual_Same": PALETTE["A_actual_same"],
+        "B_Remaining_From_Prev": PALETTE["B_fore_prev"],
+        "C_Remaining_From_Same": PALETTE["C_fore_same"],
+    }
+    chart = alt.Chart(melt).mark_bar().encode(
+        x=alt.X("Source:N", sort=alt.SortField("Source")),
+        y=alt.Y("Value:Q"),
+        color=alt.Color("Component:N",
+                        scale=alt.Scale(domain=list(color_map.keys()), range=list(color_map.values())),
+                        legend=alt.Legend(title="Component",
+                                          orient="top",
+                                          labelLimit=240)),
+        tooltip=[alt.Tooltip("Source:N"),
+                 alt.Tooltip("Component:N"),
+                 alt.Tooltip("Value:Q", format=",.1f")]
+    ).properties(height=340, title="Predictibility: A (Actual Same) + B (Remaining from Prev) + C (Remaining from Same)")
+    return chart
+
+# ----------------------------
 # UI
 # ----------------------------
 with st.sidebar:
     st.header("JetLearn • Navigation")
-    view = st.radio("Go to", ["MIS"], index=0)
-    st.caption("Use the quick periods, filters, or the Custom tab.")
+    view = st.radio("Go to", ["MIS", "Predictibility"], index=0)
+    st.caption("Use the MIS quick periods, filters, or the Predictibility tab for month-end forecast.")
 
 st.title("📊 JetLearn MIS")
 st.markdown(
@@ -455,12 +676,13 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.write("Visualizes **Enrolments (Payments)**, **Conversion%** (per-pipeline denominators), and **Trend**.")
+
+st.write("Visualizes **Enrolments (Payments)**, **Conversion%** (per-pipeline denominators), **Trend**, and **Predictibility** for the running month.")
 
 # --- Data source (no checkbox; exclusion is ALWAYS ON) ---
 col_ds1, col_ds2 = st.columns([3, 2])
 with col_ds1:
-    default_path = "Master_sheet_DB.csv"  # if you uploaded, keep the same filename in app directory
+    default_path = "Master_sheet_DB.csv"
     data_src = st.text_input("Data file path", value=default_path, help="CSV path (pre-uploaded in the repo).")
 with col_ds2:
     st.caption("‘1.2 Invalid Deal(s)’ are automatically excluded from all views.")
@@ -527,11 +749,8 @@ with st.expander("Filters", expanded=True):
 df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellors, sel_countries, sel_sources)
 st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
 
-# Show-all toggle
-show_all = st.checkbox("Show all preset periods (Yesterday • Today • Last Month • This Month)", value=False)
-
 # ----------------------------
-# Period sections (Counts + Conversion% + Trend)
+# MIS
 # ----------------------------
 def render_period_block(title: str, range_start: date, range_end: date, running_month_anchor: date):
     st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
@@ -573,6 +792,7 @@ def render_period_block(title: str, range_start: date, range_end: date, running_
     st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 if view == "MIS":
+    show_all = st.checkbox("Show all preset periods (Yesterday • Today • Last Month • This Month)", value=False)
     if show_all:
         st.subheader("Preset Periods")
         colA, colB = st.columns(2)
@@ -679,6 +899,72 @@ if view == "MIS":
                             create_col=create_col, pay_col=pay_col
                         )
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
+
+# ----------------------------
+# Predictibility
+# ----------------------------
+if view == "Predictibility":
+    st.subheader("Predictibility – Running Month Enrolment Forecast")
+    st.caption(
+        "A = actual MTD enrolments from **same-month deals**. "
+        "B = forecast for remaining days from **previous-months’ deals** using source-wise lookback shares. "
+        "C = forecast for remaining days from **same-month deals**. "
+        "Month-end total per source is paced from MTD."
+    )
+
+    colp1, colp2, colp3 = st.columns([1,1,2])
+    with colp1:
+        lookback = st.selectbox("Lookback window (months)", [3, 6, 12], index=0)
+    with colp2:
+        weighting = st.radio("Share averaging", ["Recency-weighted", "Simple average"], index=0, horizontal=False)
+        weighted = (weighting == "Recency-weighted")
+    with colp3:
+        st.info("Recency-weighted uses linear weights (1..k) with higher weight on more recent months within the selected lookback.")
+
+    tbl, totals = predict_running_month(df_f, create_col, pay_col, source_col, lookback, weighted, today)
+
+    c1, c2 = st.columns([3,2])
+    with c1:
+        st.altair_chart(predict_chart(tbl), use_container_width=True)
+    with c2:
+        st.markdown("### Totals")
+        st.markdown(
+            f"""
+            <div class='kpi-card'>
+              <div class='kpi-title'>A · Actual from same-month deals (to date)</div>
+              <div class='kpi-value' style='color:{PALETTE["A_actual_same"]}'>{totals['A_Actual_Same']:.1f}</div>
+              <div class='kpi-sub'>So far this month</div>
+            </div>
+            <br/>
+            <div class='kpi-card'>
+              <div class='kpi-title'>B · Remaining from previous-months deals (forecast)</div>
+              <div class='kpi-value' style='color:{PALETTE["B_fore_prev"]}'>{totals['B_Remaining_From_Prev']:.1f}</div>
+            </div>
+            <br/>
+            <div class='kpi-card'>
+              <div class='kpi-title'>C · Remaining from same-month deals (forecast)</div>
+              <div class='kpi-value' style='color:{PALETTE["C_fore_same"]}'>{totals['C_Remaining_From_Same']:.1f}</div>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    with st.expander("Detailed table"):
+        show_cols = ["Source","A_Actual_Same","B_Remaining_From_Prev","C_Remaining_From_Same",
+                     "Projected_MonthEnd_Total","WAvg_Same_Share","WAvg_Prev_Share"]
+        if not tbl.empty:
+            view_tbl = tbl[show_cols].copy()
+            view_tbl["Projected_MonthEnd_Total"] = view_tbl["Projected_MonthEnd_Total"].round(1)
+            view_tbl["WAvg_Same_Share"] = (view_tbl["WAvg_Same_Share"]*100).round(1)
+            view_tbl["WAvg_Prev_Share"] = (view_tbl["WAvg_Prev_Share"]*100).round(1)
+            view_tbl = view_tbl.rename(columns={
+                "Projected_MonthEnd_Total":"Projected Total (ME)",
+                "WAvg_Same_Share":"Same% (w-avg)",
+                "WAvg_Prev_Share":"Prev% (w-avg)"
+            })
+            st.dataframe(view_tbl, use_container_width=True)
+        else:
+            st.info("No data in scope for the running month after filters.")
 
 # Optional: data preview
 with st.expander("Data preview & column mapping", expanded=False):
