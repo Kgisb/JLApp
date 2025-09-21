@@ -140,6 +140,7 @@ def apply_filters(
     return f
 
 # ---------- Always-on exclusion for Invalid Deals ----------
+import re
 INVALID_RE = re.compile(r"^\s*1\.2\s*invalid\s*deal[s]?\s*$", flags=re.IGNORECASE)
 
 def exclude_invalid_deals(df: pd.DataFrame, dealstage_col: str | None) -> tuple[pd.DataFrame, int]:
@@ -435,7 +436,7 @@ def trend_chart(ts: pd.DataFrame, title: str):
     return alt.layer(bars, line_mtd, line_coh).resolve_scale(y='independent').properties(title=title)
 
 # ----------------------------
-# PREDICTIBILITY core (UPDATED A/B/C)
+# PREDICTIBILITY core (A/B/C via lookback daily rates)
 # ----------------------------
 def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFrame:
     d = df.copy()
@@ -446,55 +447,74 @@ def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFr
     d["_same_month"] = (d["_create_m"] == d["_pay_m"])
     return d
 
-def source_wavg_same_share(d_hist: pd.DataFrame, source_col: str, lookback: int, weighted: bool):
-    """Weighted-average same-month share per source across last `lookback` pay-months (excluding current)."""
+def month_days(period: pd.Period) -> int:
+    y, m = period.year, period.month
+    return monthrange(y, m)[1]
+
+def per_source_monthly_counts(d_hist: pd.DataFrame, source_col: str):
+    """Return frame with per-month, per-source counts split by same vs prev."""
     if d_hist.empty:
-        return {}, 0.5  # fallback
+        return pd.DataFrame(columns=["_pay_m", source_col, "cnt_same", "cnt_prev", "days_in_month"])
+    g = d_hist.groupby(["_pay_m", source_col])
+    by = g["_same_month"].agg(
+        cnt_same=lambda s: int(s.sum()),
+        cnt_prev=lambda s: int((~s).sum())
+    ).reset_index()
+    by["days_in_month"] = by["_pay_m"].apply(month_days)
+    return by
+
+def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: int, weighted: bool):
+    """
+    Compute per-source daily rates for same-month and prev-month payments from the last `lookback` pay-months.
+    Weighted by month recency if `weighted=True` (1..k).
+    Also returns overall fallback rates.
+    """
+    if d_hist.empty:
+        return {}, {}, 0.0, 0.0
+
     months = sorted(d_hist["_pay_m"].unique())
     months = months[-lookback:] if len(months) > lookback else months
-    weights = {m: (i+1 if weighted else 1.0) for i, m in enumerate(months)}
+    d_hist = d_hist[d_hist["_pay_m"].isin(months)].copy()
 
-    shares_per_src = {}
-    for m in months:
-        sub = d_hist[d_hist["_pay_m"] == m]
-        if sub.empty:
-            continue
-        gsize = sub.groupby(source_col).size().rename("total")
-        gsame = sub[sub["_same_month"]].groupby(source_col).size().rename("same_cnt")
-        by_src = pd.concat([gsize, gsame], axis=1).fillna(0.0).reset_index()
-        by_src["same_share_m"] = by_src.apply(lambda r: (r["same_cnt"]/r["total"]) if r["total"]>0 else 0.0, axis=1)
-        for _, row in by_src.iterrows():
-            src = str(row[source_col])
-            shares_per_src.setdefault(src, []).append((m, row["same_share_m"]))
+    by = per_source_monthly_counts(d_hist, source_col)
 
-    same_share_src = {}
-    for src, lst in shares_per_src.items():
-        num = sum(weights[m] * s for m, s in lst)
-        den = sum(weights[m] for m, _ in lst)
-        same_share_src[src] = (num/den) if den > 0 else 0.0
+    # Weights per month
+    month_to_w = {m: (i+1 if weighted else 1.0) for i, m in enumerate(sorted(months))}
 
-    # overall fallback
-    overall_by_m = {}
-    for m in months:
-        sub = d_hist[d_hist["_pay_m"] == m]
-        tot = len(sub)
-        same = int(sub["_same_month"].sum())
-        overall_by_m[m] = (same / tot) if tot > 0 else 0.0
-    num = sum(overall_by_m[m] * weights[m] for m in months)
-    den = sum(weights[m] for m in months)
-    overall_same = (num/den) if den > 0 else 0.5
-    return same_share_src, overall_same
+    # Per-source weighted daily rates
+    rates_same, rates_prev = {}, {}
+    for src, sub in by.groupby(source_col):
+        num_same = (sub["cnt_same"] / sub["days_in_month"] * sub["_pay_m"].map(month_to_w)).sum()
+        den_same = sub["_pay_m"].map(month_to_w).sum()
+        num_prev = (sub["cnt_prev"] / sub["days_in_month"] * sub["_pay_m"].map(month_to_w)).sum()
+        den_prev = den_same
+        rates_same[str(src)] = float(num_same/den_same) if den_same > 0 else 0.0
+        rates_prev[str(src)] = float(num_prev/den_prev) if den_prev > 0 else 0.0
+
+    # Overall fallback (all sources combined)
+    by_overall = d_hist.groupby("_pay_m")["_same_month"].agg(
+        cnt_same=lambda s: int(s.sum()),
+        cnt_prev=lambda s: int((~s).sum())
+    ).reset_index()
+    by_overall["days_in_month"] = by_overall["_pay_m"].apply(month_days)
+    num_same_o = (by_overall["cnt_same"] / by_overall["days_in_month"] * by_overall["_pay_m"].map(month_to_w)).sum()
+    num_prev_o = (by_overall["cnt_prev"] / by_overall["days_in_month"] * by_overall["_pay_m"].map(month_to_w)).sum()
+    den_o = by_overall["_pay_m"].map(month_to_w).sum()
+    overall_same_rate = float(num_same_o/den_o) if den_o > 0 else 0.0
+    overall_prev_rate = float(num_prev_o/den_o) if den_o > 0 else 0.0
+
+    return rates_same, rates_prev, overall_same_rate, overall_prev_rate
 
 def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
                           lookback: int, weighted: bool, today: date):
     """
     Returns (table_df, totals_dict) with columns:
-      Source, A_Actual_ToDate, B_Remaining_Total, C_Remaining_From_SameMonth,
-      Remaining_From_PrevMonth, Projected_MonthEnd_Total, SameShare_WAvg
-    Definitions:
-      A = payments received in running month to date
-      B = remaining total forecast for running month (regardless of create month)
-      C = of that remaining, portion expected from current-month-created deals
+      Source, A_Actual_ToDate, B_Remaining_SameMonth, C_Remaining_PrevMonths,
+      Projected_MonthEnd_Total, Rate_Same_Daily, Rate_Prev_Daily
+    A = actual payments (pay month = current), to date
+    B = remaining_days * daily_same_rate (from lookback)
+    C = remaining_days * daily_prev_rate  (from lookback)
+    Total projection = A + B + C
     """
     # Ensure source column
     if source_col is None or source_col not in df_f.columns:
@@ -509,101 +529,79 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
     cur_start, cur_end = month_bounds(today)
     cur_period = pd.Period(today, freq="M")
 
-    # Realized payments this month (A)
+    # A: realized payments this month
     d_cur = d[d["_pay_m"] == cur_period].copy()
     if d_cur.empty:
-        realized_by_src = pd.DataFrame(columns=[source_col, "realized_total", "realized_same"])
+        realized_by_src = pd.DataFrame(columns=[source_col, "A"])
     else:
-        realized_by_src = d_cur.groupby(source_col).apply(
-            lambda x: pd.Series({
-                "realized_total": len(x),               # A component per source
-                "realized_same": int(x["_same_month"].sum()),   # for C net remaining
-            })
-        ).reset_index()
+        realized_by_src = d_cur.groupby(source_col).size().rename("A").reset_index()
 
-    # Historical same-month shares for C split
+    # Lookback history (exclude current pay month)
     d_hist = d[d["_pay_m"] < cur_period].copy()
-    if not d_hist.empty:
-        months_present = sorted(d_hist["_pay_m"].unique())
-        months_keep = months_present[-lookback:] if len(months_present) > lookback else months_present
-        d_hist = d_hist[d_hist["_pay_m"].isin(months_keep)]
+    rates_same, rates_prev, overall_same_rate, overall_prev_rate = daily_rates_from_lookback(
+        d_hist, source_col, lookback, weighted
+    )
 
-    same_share_src, overall_same = source_wavg_same_share(d_hist, source_col, lookback, weighted)
-
-    # Pace to month-end for B
+    # Remaining days
     elapsed_days = (today - cur_start).days + 1
     total_days   = (cur_end - cur_start).days + 1
+    remaining_days = max(0, total_days - elapsed_days)
 
-    by_src = realized_by_src.set_index(source_col) if not realized_by_src.empty else pd.DataFrame().set_index(source_col)
-    sources_realized = set(d_cur[source_col].dropna().astype(str)) if not d_cur.empty else set()
-    sources_hist = set(same_share_src.keys())
-    all_sources = sorted(sources_realized | sources_hist | ({"All"} if source_col == "_Source" else set()))
+    # Universe of sources
+    src_realized = set(d_cur[source_col].dropna().astype(str)) if not d_cur.empty else set()
+    src_hist = set(list(rates_same.keys()) + list(rates_prev.keys()))
+    all_sources = sorted(src_realized | src_hist | ({"All"} if source_col == "_Source" else set()))
 
+    A_tot = B_tot = C_tot = 0.0
     rows = []
-    T_A = T_B = T_C = T_prev = T_proj = 0.0
+    a_map = dict(zip(realized_by_src[source_col], realized_by_src["A"])) if not realized_by_src.empty else {}
+
     for src in all_sources:
-        if not by_src.empty and src in by_src.index:
-            r = by_src.loc[src]
-            realized_total = int(r.get("realized_total", 0))   # A per source
-            realized_same  = int(r.get("realized_same", 0))
-        else:
-            realized_total = 0
-            realized_same = 0
+        a_val = float(a_map.get(src, 0.0))
+        rate_same = rates_same.get(src, overall_same_rate)
+        rate_prev = rates_prev.get(src, overall_prev_rate)
 
-        per_day = (realized_total / elapsed_days) if elapsed_days > 0 else 0.0
-        projected_total = per_day * total_days
-
-        # Remaining total for month (B)
-        remaining_total = max(0.0, projected_total - realized_total)
-
-        # Same-month share for month-end (for C)
-        same_share = same_share_src.get(src, overall_same)
-        expected_same_total = projected_total * same_share
-        remaining_same = max(0.0, expected_same_total - realized_same)  # C per source
-
-        # Remaining from previous months (for stacked chart & sanity)
-        remaining_prev = max(0.0, remaining_total - remaining_same)
+        b_val = float(rate_same * remaining_days)
+        c_val = float(rate_prev * remaining_days)
 
         rows.append({
             "Source": src,
-            "A_Actual_ToDate": float(realized_total),
-            "B_Remaining_Total": float(remaining_total),
-            "C_Remaining_From_SameMonth": float(remaining_same),
-            "Remaining_From_PrevMonth": float(remaining_prev),
-            "Projected_MonthEnd_Total": float(projected_total),
-            "SameShare_WAvg": float(same_share),
+            "A_Actual_ToDate": a_val,
+            "B_Remaining_SameMonth": b_val,
+            "C_Remaining_PrevMonths": c_val,
+            "Projected_MonthEnd_Total": a_val + b_val + c_val,
+            "Rate_Same_Daily": rate_same,
+            "Rate_Prev_Daily": rate_prev,
+            "Remaining_Days": remaining_days
         })
-
-        T_A += realized_total
-        T_B += remaining_total
-        T_C += remaining_same
-        T_prev += remaining_prev
-        T_proj += projected_total
+        A_tot += a_val
+        B_tot += b_val
+        C_tot += c_val
 
     tbl = pd.DataFrame(rows).sort_values("Source").reset_index(drop=True)
     totals = {
-        "A_Actual_ToDate": T_A,
-        "B_Remaining_Total": T_B,
-        "C_Remaining_From_SameMonth": T_C,
-        "Remaining_From_PrevMonth": T_prev,
-        "Projected_MonthEnd_Total": T_proj
+        "A_Actual_ToDate": A_tot,
+        "B_Remaining_SameMonth": B_tot,
+        "C_Remaining_PrevMonths": C_tot,
+        "Projected_MonthEnd_Total": A_tot + B_tot + C_tot,
+        "Remaining_Days": remaining_days
     }
     return tbl, totals
 
 def predict_chart_stacked(tbl: pd.DataFrame):
-    """Non-double-counting stacked view: A + Remaining Prev + Remaining Same."""
+    """Stacked view: A + B + C = projection."""
     if tbl.empty:
         return alt.Chart(pd.DataFrame({"x":[],"y":[]}))
     melt = tbl.melt(
         id_vars=["Source"],
-        value_vars=["A_Actual_ToDate","Remaining_From_PrevMonth","C_Remaining_From_SameMonth"],
+        value_vars=["A_Actual_ToDate","B_Remaining_SameMonth","C_Remaining_PrevMonths"],
         var_name="Component",
         value_name="Value"
     )
     color_map = {
         "A_Actual_ToDate": PALETTE["A_actual"],
-        "Remaining_From_PrevMonth": PALETTE["Rem_prev"],
-        "C_Remaining_From_SameMonth": PALETTE["Rem_same"],
+        "B_Remaining_SameMonth": PALETTE["Rem_same"],
+        "C_Remaining_PrevMonths": PALETTE["Rem_prev"],
     }
     chart = alt.Chart(melt).mark_bar().encode(
         x=alt.X("Source:N", sort=alt.SortField("Source")),
@@ -614,7 +612,7 @@ def predict_chart_stacked(tbl: pd.DataFrame):
         tooltip=[alt.Tooltip("Source:N"),
                  alt.Tooltip("Component:N"),
                  alt.Tooltip("Value:Q", format=",.1f")]
-    ).properties(height=360, title="Predictibility (A + Remaining Prev + Remaining Same)")
+    ).properties(height=360, title="Predictibility (A + B + C = Projected Month-End)")
     return chart
 
 # ----------------------------
@@ -811,29 +809,28 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Predictibility (UPDATED A/B/C)
+# Predictibility (A/B/C via lookback daily rates)
 # ----------------------------
 if view == "Predictibility":
     st.subheader("Predictibility – Running Month Enrolment Forecast")
     st.caption(
         "A = payments received **to date** in the running month. "
-        "B = **remaining** forecast for the running month (regardless of create month). "
-        "C = of B, the portion expected from **deals created in the running month** (based on historical same-month share)."
+        "B = forecast for remaining days from **same-month created** deals using lookback daily rate. "
+        "C = forecast for remaining days from **previous-months created** deals using lookback daily rate. "
+        "Projected month-end = A + B + C."
     )
 
     colp1, colp2, colp3 = st.columns([1,1,2])
     with colp1:
-        lookback = st.selectbox("Lookback window for same-month share", [3, 6, 12], index=0)
+        lookback = st.selectbox("Lookback window (months)", [3, 6, 12], index=0)
     with colp2:
-        weighting = st.radio("Averaging for share", ["Recency-weighted", "Simple average"], index=0, horizontal=False)
+        weighting = st.radio("Averaging", ["Recency-weighted", "Simple average"], index=0, horizontal=False)
         weighted = (weighting == "Recency-weighted")
     with colp3:
-        st.info("C uses historical same-month shares per source over your lookback (recency-weighted or simple). B uses MTD pacing.")
+        st.info("Daily rates are computed per source from the last K pay-months (excluding current). Recency weighting uses 1..K.")
 
     # Sanity: payments in current month (after filters)
     cur_start, cur_end = month_bounds(today)
-    d_preview = pd.DataFrame()
-    # re-use add_month_cols for preview
     d_preview = add_month_cols(df_f, create_col, pay_col)
     cur_period = pd.Period(today, freq="M")
     in_cur_pay = d_preview["_pay_m"] == cur_period
@@ -847,29 +844,22 @@ if view == "Predictibility":
     with c1:
         st.markdown(f"<div class='kpi-card'><div class='kpi-title'>A · Actual to date</div><div class='kpi-value' style='color:{PALETTE['A_actual']}'>{totals['A_Actual_ToDate']:.1f}</div></div>", unsafe_allow_html=True)
     with c2:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>B · Remaining (total)</div><div class='kpi-value' style='color:{PALETTE['Total']}'>{totals['B_Remaining_Total']:.1f}</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>B · Remaining (same-month)</div><div class='kpi-value' style='color:{PALETTE['Rem_same']}'>{totals['B_Remaining_SameMonth']:.1f}</div></div>", unsafe_allow_html=True)
     with c3:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>C · Remaining from same-month deals</div><div class='kpi-value' style='color:{PALETTE['Rem_same']}'>{totals['C_Remaining_From_SameMonth']:.1f}</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>C · Remaining (prev-months)</div><div class='kpi-value' style='color:{PALETTE['Rem_prev']}'>{totals['C_Remaining_PrevMonths']:.1f}</div></div>", unsafe_allow_html=True)
     with c4:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Remaining from previous months</div><div class='kpi-value' style='color:{PALETTE['Rem_prev']}'>{totals['Remaining_From_PrevMonth']:.1f}</div><div class='kpi-sub'>= B − C</div></div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Projected Month-End</div><div class='kpi-value' style='color:{PALETTE['Total']}'>{totals['Projected_MonthEnd_Total']:.1f}</div><div class='kpi-sub'>A + B + C</div></div>", unsafe_allow_html=True)
 
-    # Stacked chart (no double count): A + Remaining Prev + Remaining Same
+    # Stacked chart (A + B + C = projection)
     st.altair_chart(predict_chart_stacked(tbl), use_container_width=True)
 
     with st.expander("Detailed table"):
-        show_cols = ["Source","A_Actual_ToDate","B_Remaining_Total","C_Remaining_From_SameMonth",
-                     "Remaining_From_PrevMonth","Projected_MonthEnd_Total","SameShare_WAvg"]
+        show_cols = ["Source","A_Actual_ToDate","B_Remaining_SameMonth","C_Remaining_PrevMonths",
+                     "Projected_MonthEnd_Total","Rate_Same_Daily","Rate_Prev_Daily","Remaining_Days"]
         if not tbl.empty:
             view_tbl = tbl[show_cols].copy()
-            view_tbl["Projected_MonthEnd_Total"] = view_tbl["Projected_MonthEnd_Total"].round(1)
-            view_tbl["SameShare_WAvg"] = (view_tbl["SameShare_WAvg"]*100).round(1)
-            view_tbl = view_tbl.rename(columns={
-                "B_Remaining_Total": "Remaining Total (B)",
-                "C_Remaining_From_SameMonth": "Remaining Same-Month (C)",
-                "Remaining_From_PrevMonth": "Remaining Prev-Months",
-                "Projected_MonthEnd_Total": "Projected Total (ME)",
-                "SameShare_WAvg": "Same-Month Share % (w-avg)"
-            })
+            for c in ["B_Remaining_SameMonth","C_Remaining_PrevMonths","Projected_MonthEnd_Total","Rate_Same_Daily","Rate_Prev_Daily"]:
+                view_tbl[c] = view_tbl[c].astype(float).round(3)
             st.dataframe(view_tbl, use_container_width=True)
         else:
             st.info("No data in scope for the running month after filters.")
