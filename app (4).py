@@ -3,12 +3,11 @@ import pandas as pd
 import numpy as np
 import altair as alt
 from datetime import datetime, date, timedelta
-import math
 import re
 from calendar import monthrange
 
 st.set_page_config(
-    page_title="JetLearn MIS – Enrolments (MTD & Cohort) + Conversion%",
+    page_title="JetLearn MIS – Enrolments (MTD & Cohort) + Conversion% + Predictibility",
     page_icon="📊",
     layout="wide",
 )
@@ -90,23 +89,21 @@ def find_col(df: pd.DataFrame, candidates):
     return None
 
 def coerce_datetime(series: pd.Series) -> pd.Series:
+    # Robust parsing; turns blanks/invalids into NaT
     s = pd.to_datetime(series, errors="coerce", infer_datetime_format=True, dayfirst=True)
     if s.notna().sum() == 0:
-        try:
-            s = pd.to_datetime(series, errors="coerce", unit="s")
-        except Exception:
+        # try epoch seconds / ms fallback if entire col failed
+        for unit in ["s", "ms"]:
             try:
-                s = pd.to_datetime(series, errors="coerce", unit="ms")
+                s = pd.to_datetime(series, errors="coerce", unit=unit)
+                break
             except Exception:
                 pass
     return s
 
 def month_bounds(d: date):
     start = date(d.year, d.month, 1)
-    if d.month == 12:
-        end = date(d.year, 12, 31)
-    else:
-        end = date(d.year, d.month, monthrange(d.year, d.month)[1])
+    end = date(d.year, d.month, monthrange(d.year, d.month)[1])
     return start, end
 
 def last_month_bounds(today: date):
@@ -266,7 +263,7 @@ def prepare_conversion_for_range(
                   "cohort": {"Total": coh_total, "AI Coding": coh_ai, "Math": coh_math}}
     return mtd_pct, coh_pct, denoms, numerators
 
-# ---------- MIS visual bits ----------
+# ---------- MIS visuals ----------
 def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, denominator: int,
                  thresholds=(10, 20)):
     p = float(max(0.0, min(100.0, percent)))
@@ -449,94 +446,71 @@ def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFr
     d["_same_month"] = (d["_create_m"] == d["_pay_m"])
     return d
 
-def month_iter(end_month: pd.Period, back: int):
-    # yields most-recent first, excluding end_month itself
-    for i in range(1, back+1):
-        yield end_month - i
-
 def source_wavg_shares(d_hist: pd.DataFrame, source_col: str, lookback: int, weighted: bool):
     """
-    Compute per-source weighted-average shares for:
-      same_share: share of month’s enrolments whose create-month == pay-month
-      prev_share: 1 - same_share
-    over 'lookback' months prior to current month.
+    Per-source weighted-average shares for the pay-month composed of:
+      - same_share: proportion where create-month == pay-month
+      - prev_share: 1 - same_share
+    Computed over the last `lookback` months BEFORE the current month.
     """
     if d_hist.empty:
-        return {}, 0.0, 0.0
+        # Fallback: 50/50 overall if no history
+        return {}, {}, 0.5, 0.5
 
-    # Build month -> weights
+    # Determine which months to keep (last `lookback` months found in d_hist)
     months = sorted(d_hist["_pay_m"].unique())
-    # Keep last 'lookback' months only
-    if len(months) > lookback:
-        months = months[-lookback:]
+    months = months[-lookback:] if len(months) > lookback else months
 
-    weights = {}
-    if weighted:
-        # Recency weights 1..k for oldest..newest among the months we’re using
-        k = len(months)
-        for idx, m in enumerate(months, start=1):
-            weights[m] = idx  # linear recency
-    else:
-        for m in months:
-            weights[m] = 1.0
+    # Build recency weights (older=1 ... newest=k) or simple average
+    weights = {m: (i+1 if weighted else 1.0) for i, m in enumerate(months)}
 
-    # precompute per (source, month): same_count and total_count
-    shares = {}
+    # Compute per-month, per-source same-share
+    shares_per_src = {}
     for m in months:
         sub = d_hist[d_hist["_pay_m"] == m]
         if sub.empty:
             continue
-        by_src = sub.groupby(source_col).agg(
-            same_cnt=("_same_month", "sum"),
-            total=(" _same_month".strip(), "count")  # trick to use a constant existing col
-        ).reset_index()
-        # Alt method: total = group size
-        by_src = sub.groupby(source_col).size().to_frame("total").join(
-            sub[sub["_same_month"]].groupby(source_col).size().to_frame("same_cnt"),
-            how="left"
-        ).fillna(0).reset_index()
-
+        gsize = sub.groupby(source_col).size().rename("total")
+        gsame = sub[sub["_same_month"]].groupby(source_col).size().rename("same_cnt")
+        by_src = pd.concat([gsize, gsame], axis=1).fillna(0.0).reset_index()
+        by_src["same_share_m"] = by_src.apply(
+            lambda r: (r["same_cnt"] / r["total"]) if r["total"] > 0 else 0.0, axis=1
+        )
         for _, row in by_src.iterrows():
             src = str(row[source_col])
-            same_share_m = (row["same_cnt"] / row["total"]) if row["total"] > 0 else 0.0
-            shares.setdefault(src, []).append((m, same_share_m))
+            shares_per_src.setdefault(src, []).append((m, row["same_share_m"]))
 
-    # Aggregate weighted average
-    result_same = {}
-    for src, lst in shares.items():
-        num = 0.0
-        den = 0.0
-        for m, s in lst:
-            w = weights.get(m, 0.0)
-            num += w * s
-            den += w
-        result_same[src] = (num/den) if den > 0 else 0.0
+    # Weighted avg per source
+    same_share_src = {}
+    for src, lst in shares_per_src.items():
+        num = sum(weights[m] * s for m, s in lst)
+        den = sum(weights[m] for m, _ in lst)
+        same_share_src[src] = (num/den) if den > 0 else 0.0
 
-    # Overall fallback (across all sources)
-    # Compute overall same_share per month, then weighted-avg
-    overall_same_by_m = {}
+    # Overall fallback (across sources) if a source missing
+    overall_by_m = {}
     for m in months:
         sub = d_hist[d_hist["_pay_m"] == m]
         tot = len(sub)
         same = int(sub["_same_month"].sum())
-        overall_same_by_m[m] = (same / tot) if tot > 0 else 0.0
-    num = sum(overall_same_by_m[m] * weights[m] for m in months)
+        overall_by_m[m] = (same / tot) if tot > 0 else 0.0
+    num = sum(overall_by_m[m] * weights[m] for m in months)
     den = sum(weights[m] for m in months)
-    overall_same = (num/den) if den > 0 else 0.5  # neutral fallback
+    overall_same = (num/den) if den > 0 else 0.5
 
-    # Convert to prev shares
-    result_prev = {k: max(0.0, min(1.0, 1.0 - v)) for k, v in result_same.items()}
-    overall_prev = max(0.0, min(1.0, 1.0 - overall_same))
-    return (result_same, result_prev, overall_same, overall_prev)
+    overall_prev = 1.0 - overall_same
+    prev_share_src = {k: 1.0 - v for k, v in same_share_src.items()}
+    return same_share_src, prev_share_src, overall_same, overall_prev
 
 def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
                           lookback: int, weighted: bool, today: date):
-    """Returns (table_df, totals_dict) with columns:
-       Source, A_Actual_Same, B_Remaining_From_Prev, C_Remaining_From_Same,
-       Projected_MonthEnd_Total, WAvg_Same_Share, WAvg_Prev_Share
     """
+    Returns (table_df, totals_dict) with columns:
+      Source, A_Actual_Same, B_Remaining_From_Prev, C_Remaining_From_Same,
+      Projected_MonthEnd_Total, WAvg_Same_Share, WAvg_Prev_Share
+    """
+    # Ensure we have a source column
     if source_col is None or source_col not in df_f.columns:
-        # fabricate a source column = "All"
         df_work = df_f.copy()
         source_col = "_Source"
         df_work[source_col] = "All"
@@ -545,74 +519,80 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
 
     d = add_month_cols(df_work, create_col, pay_col)
 
-    # Current month range
+    # Current month as a Period for exact month equality (robust vs. timestamps)
     cur_start, cur_end = month_bounds(today)
-    cur_period = pd.Period(cur_start, freq="M")
+    cur_period = pd.Period(today, freq="M")
 
-    in_cur_pay = d["_pay_dt"].dt.date.between(cur_start, cur_end)
+    # Payments realized in current month (month equality, NOT date-range)
+    in_cur_pay = d["_pay_m"] == cur_period
     d_cur = d.loc[in_cur_pay].copy()
 
-    # Realized so far (split by whether created in current month)
-    realized_by_src = d_cur.groupby(source_col).apply(
-        lambda x: pd.Series({
-            "realized_total": len(x),
-            "realized_same": int((x["_same_month"]).sum()),
-            "realized_prev": int((~x["_same_month"]).sum()),
-        })
-    ).reset_index()
+    # Realized splits to date
+    if d_cur.empty:
+        realized_by_src = pd.DataFrame(columns=[source_col, "realized_total", "realized_same", "realized_prev"])
+    else:
+        realized_by_src = d_cur.groupby(source_col).apply(
+            lambda x: pd.Series({
+                "realized_total": len(x),
+                "realized_same": int(x["_same_month"].sum()),
+                "realized_prev": int((~x["_same_month"]).sum()),
+            })
+        ).reset_index()
 
-    # Historical months (exclude current)
+    # Historical dataset (exclude current month)
     d_hist = d[d["_pay_m"] < cur_period].copy()
-    # Keep only months present in lookback
     if not d_hist.empty:
-        last_month = d_hist["_pay_m"].max()
-        months_keep = list(month_iter(cur_period, lookback))
+        # keep only the last `lookback` months actually present
+        months_present = sorted(d_hist["_pay_m"].unique())
+        months_keep = months_present[-lookback:] if len(months_present) > lookback else months_present
         d_hist = d_hist[d_hist["_pay_m"].isin(months_keep)]
 
-    # Shares by source
-    same_shares, prev_shares, overall_same, overall_prev = source_wavg_shares(d_hist, source_col, lookback, weighted)
+    same_shares, prev_shares, overall_same, overall_prev = source_wavg_shares(
+        d_hist, source_col, lookback, weighted
+    )
 
-    # MTD pace → project month-end totals per source
+    # Pace to month-end
     elapsed_days = (today - cur_start).days + 1
     total_days = (cur_end - cur_start).days + 1
+    by_src = realized_by_src.set_index(source_col) if not realized_by_src.empty else pd.DataFrame().set_index(source_col)
 
-    by_src = realized_by_src.set_index(source_col)
-    all_sources = sorted(d_cur[source_col].dropna().unique().tolist())
-    # Include sources appearing historically but not yet this month
-    all_sources = sorted(set(all_sources) | set(same_shares.keys()) | set(prev_shares.keys()))
+    # All sources to consider (realized this month OR seen historically)
+    sources_realized = set(d_cur[source_col].dropna().astype(str)) if not d_cur.empty else set()
+    sources_hist = set(same_shares.keys()) | set(prev_shares.keys())
+    all_sources = sorted(sources_realized | sources_hist | ({"All"} if source_col == "_Source" else set()))
 
-    rows = []
-    tot_A = tot_B = tot_C = 0.0
+    rows, tot_A, tot_B, tot_C = [], 0.0, 0.0, 0.0
     for src in all_sources:
-        r = by_src.loc[src] if src in by_src.index else pd.Series({"realized_total":0, "realized_same":0, "realized_prev":0})
-        realized_total = int(r["realized_total"])
-        realized_same = int(r["realized_same"])
-        realized_prev = int(r["realized_prev"])
+        if not by_src.empty and src in by_src.index:
+            r = by_src.loc[src]
+            realized_total = int(r.get("realized_total", 0))
+            realized_same  = int(r.get("realized_same", 0))
+            realized_prev  = int(r.get("realized_prev", 0))
+        else:
+            realized_total = realized_same = realized_prev = 0
 
-        # pace
-        per_day = realized_total / elapsed_days if elapsed_days > 0 else 0.0
+        # Month-end projection via simple MTD pace
+        per_day = (realized_total / elapsed_days) if elapsed_days > 0 else 0.0
         projected_total = per_day * total_days
 
-        # shares
+        # Shares: per-source, else overall fallback
         same_share = same_shares.get(src, overall_same)
         prev_share = prev_shares.get(src, overall_prev)
 
-        # expected month-end components
         exp_same_total = projected_total * same_share
         exp_prev_total = projected_total * prev_share
 
-        # remaining forecasts
         rem_from_same = max(0.0, exp_same_total - realized_same)
         rem_from_prev = max(0.0, exp_prev_total - realized_prev)
 
         rows.append({
             "Source": src,
-            "A_Actual_Same": realized_same,
-            "B_Remaining_From_Prev": rem_from_prev,
-            "C_Remaining_From_Same": rem_from_same,
-            "Projected_MonthEnd_Total": projected_total,
-            "WAvg_Same_Share": same_share,
-            "WAvg_Prev_Share": prev_share,
+            "A_Actual_Same": float(realized_same),
+            "B_Remaining_From_Prev": float(rem_from_prev),
+            "C_Remaining_From_Same": float(rem_from_same),
+            "Projected_MonthEnd_Total": float(projected_total),
+            "WAvg_Same_Share": float(same_share),
+            "WAvg_Prev_Share": float(prev_share),
         })
 
         tot_A += realized_same
@@ -620,12 +600,11 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
         tot_C += rem_from_same
 
     tbl = pd.DataFrame(rows).sort_values("Source").reset_index(drop=True)
-
     totals = {
         "A_Actual_Same": tot_A,
         "B_Remaining_From_Prev": tot_B,
         "C_Remaining_From_Same": tot_C,
-        "Projected_MonthEnd_Total": tbl["Projected_MonthEnd_Total"].sum() if not tbl.empty else 0.0
+        "Projected_MonthEnd_Total": float(tbl["Projected_MonthEnd_Total"].sum()) if not tbl.empty else 0.0
     }
     return tbl, totals
 
@@ -676,7 +655,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-
 st.write("Visualizes **Enrolments (Payments)**, **Conversion%** (per-pipeline denominators), **Trend**, and **Predictibility** for the running month.")
 
 # --- Data source (no checkbox; exclusion is ALWAYS ON) ---
@@ -685,7 +663,7 @@ with col_ds1:
     default_path = "Master_sheet_DB.csv"
     data_src = st.text_input("Data file path", value=default_path, help="CSV path (pre-uploaded in the repo).")
 with col_ds2:
-    st.caption("‘1.2 Invalid Deal(s)’ are automatically excluded from all views.")
+    st.caption("‘1.2 Invalid Deal(s)’ are automatically excluded. Rows with missing **Create Date** are dropped.")
 
 # --- Load data
 df = load_data(data_src)
@@ -711,6 +689,13 @@ source_col = find_col(df, ["JetLearn Deal Source", "Deal Source", "Source"])
 if not create_col or not pay_col:
     st.error("Could not find required date columns. Ensure the CSV has 'Create Date' and 'Payment Received Date' (or close variants).")
     st.stop()
+
+# --- Drop rows with missing/invalid Create Date (after coercion) ---
+tmp_create = coerce_datetime(df[create_col])
+missing_create = int(tmp_create.isna().sum())
+if missing_create > 0:
+    df = df.loc[tmp_create.notna()].copy()
+    st.caption(f"Removed rows with missing/invalid **Create Date**: **{missing_create:,}**")
 
 # --- Period presets
 today = date.today()
@@ -920,6 +905,13 @@ if view == "Predictibility":
         weighted = (weighting == "Recency-weighted")
     with colp3:
         st.info("Recency-weighted uses linear weights (1..k) with higher weight on more recent months within the selected lookback.")
+
+    # Sanity count for current month (after filters)
+    cur_start, cur_end = month_bounds(today)
+    d_preview = add_month_cols(df_f, create_col, pay_col)
+    cur_period = pd.Period(today, freq="M")
+    in_cur_pay = d_preview["_pay_m"] == cur_period
+    st.caption(f"Payments found this month (after filters): **{int(in_cur_pay.sum()):,}**")
 
     tbl, totals = predict_running_month(df_f, create_col, pay_col, source_col, lookback, weighted, today)
 
