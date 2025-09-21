@@ -154,7 +154,7 @@ def exclude_invalid_deals(df: pd.DataFrame, dealstage_col: str | None) -> tuple[
     removed = int((~mask_keep).sum())
     return df.loc[mask_keep].copy(), removed
 
-# ---------- MIS logic ----------
+# ---------- COUNT LOGIC (MIS) ----------
 def prepare_counts_for_range(
     df: pd.DataFrame,
     start_d: date,
@@ -194,6 +194,7 @@ def prepare_counts_for_range(
     }
     return mtd_counts, cohort_counts
 
+# ---------- CONVERSION% LOGIC (MIS) ----------
 def deals_created_mask_anchor(df: pd.DataFrame, running_month_any_date: date, create_col: str) -> pd.Series:
     d = df.copy()
     d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
@@ -422,8 +423,8 @@ def trend_chart(ts: pd.DataFrame, title: str):
 # ----------------------------
 def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFrame:
     d = df.copy()
-    d["_create_dt"] = coerce_datetime(d[create_col])
-    d["_pay_dt"]    = coerce_datetime(d[pay_col])
+    d["_create_dt"] = coerce_datetime(df[create_col])
+    d["_pay_dt"]    = coerce_datetime(df[pay_col])
     d["_create_m"]  = d["_create_dt"].dt.to_period("M")
     d["_pay_m"]     = d["_pay_dt"].dt.to_period("M")
     d["_same_month"] = (d["_create_m"] == d["_pay_m"])
@@ -478,6 +479,12 @@ def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: i
 
 def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
                           lookback: int, weighted: bool, today: date):
+    """
+    A = actual payments (pay month = current), to date
+    B = remaining_days * daily_same_rate (from lookback)
+    C = remaining_days * daily_prev_rate  (from lookback)
+    Total projection = A + B + C
+    """
     if source_col is None or source_col not in df_f.columns:
         df_work = df_f.copy()
         source_col = "_Source"
@@ -575,7 +582,7 @@ def predict_chart_stacked(tbl: pd.DataFrame):
     ).properties(height=360, title="Predictibility (A + B + C = Projected Month-End)")
     return chart
 
-# ---- Backtest & accuracy ----
+# ---- Backtest & accuracy helpers ----
 def month_list_before(period_end: pd.Period, k: int):
     months = []
     p = period_end
@@ -616,14 +623,12 @@ def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_
         actual_total = int(len(d_m))
         days_in_m = month_days(m)
 
-        # forecast: start-of-month (A=0) using trained daily rates
-        # aggregate per source with fallback
+        # forecast at start of month m
         sources = set(list(same_rates.keys()) + list(prev_rates.keys()))
         if not sources and source_col != "_Source":
-            # try sources that actually occurred in month m (so we have at least something)
             sources = set(d_m[source_col].dropna().astype(str).unique().tolist())
         if not sources:
-            sources = {"All"}  # single bucket
+            sources = {"All"}
 
         forecast = 0.0
         for src in sources:
@@ -647,14 +652,10 @@ def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_
     if bt.empty:
         return bt, {"MAPE": np.nan, "WAPE": np.nan, "MAE": np.nan, "RMSE": np.nan, "R2": np.nan}
 
-    # Metrics
     mae = bt["AbsError"].mean()
     rmse = (bt["SqError"].mean())**0.5
-    # WAPE = sum(|err|)/sum(actual)
     wape = (bt["AbsError"].sum() / bt["Actual"].sum()) if bt["Actual"].sum() > 0 else np.nan
-    # MAPE (ignore months with actual=0)
     mape = bt["APE"].dropna().mean() if bt["APE"].notna().any() else np.nan
-    # R^2 on totals
     ss_res = ((bt["Actual"] - bt["Forecast"])**2).sum()
     ss_tot = ((bt["Actual"] - bt["Actual"].mean())**2).sum()
     r2 = 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
@@ -670,7 +671,6 @@ def accuracy_scatter(bt: pd.DataFrame):
         y=alt.Y("Forecast:Q", title="Forecast (start-of-month)"),
         tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Actual:Q"), alt.Tooltip("Forecast:Q"), alt.Tooltip("Error:Q")],
     ).properties(height=360, title="Forecast vs Actual (by month)")
-    # 45-degree line
     line = alt.Chart(pd.DataFrame({"x":[bt["Actual"].min(), bt["Actual"].max()],
                                    "y":[bt["Actual"].min(), bt["Actual"].max()]})).mark_line()
     return chart + line
@@ -771,7 +771,7 @@ df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellor
 st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
 
 # ----------------------------
-# MIS (unchanged)
+# MIS
 # ----------------------------
 def render_period_block(title: str, range_start: date, range_end: date, running_month_anchor: date):
     st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
@@ -924,41 +924,64 @@ if view == "Predictibility":
         else:
             st.info("No data in scope for the running month after filters.")
 
-    # ----- NEW: Model Accuracy (Backtest) -----
-    st.subheader("Model Accuracy (Backtest)")
+    # ----- Model Accuracy (Backtest) -----
+    st.subheader("Model Accuracy")
+
     colb1, colb2 = st.columns([1,3])
     with colb1:
-        backtest_k = st.selectbox("Backtest months", [3, 6, 12], index=0,
-                                  help="How many recent months to evaluate (excluding current).")
+        backtest_k = st.selectbox(
+            "Backtest months",
+            [3, 6, 12], index=0,
+            help="How many recent months to evaluate (excluding current)."
+        )
     with colb2:
-        st.caption("For each backtested month, we forecast using only the prior lookback window and compare to actual.")
+        st.caption("Each backtested month is forecast using only the prior lookback window and compared to actual.")
 
-    bt, metrics = backtest_accuracy(df_f, create_col, pay_col, source_col,
-                                    lookback=lookback, weighted=weighted,
-                                    backtest_months=backtest_k, today=today)
+    bt, metrics = backtest_accuracy(
+        df_f, create_col, pay_col, source_col,
+        lookback=lookback, weighted=weighted,
+        backtest_months=backtest_k, today=today
+    )
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    def fmt(x, pct=False):
-        if pd.isna(x):
-            return "–"
-        return f"{x*100:.1f}%" if pct else f"{x:.2f}"
-    with m1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAPE</div><div class='kpi-value'>{fmt(metrics['MAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
-    with m2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>WAPE</div><div class='kpi-value'>{fmt(metrics['WAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
-    with m3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAE</div><div class='kpi-value'>{fmt(metrics['MAE'])}</div></div>", unsafe_allow_html=True)
-    with m4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>RMSE</div><div class='kpi-value'>{fmt(metrics['RMSE'])}</div></div>", unsafe_allow_html=True)
-    with m5: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>R²</div><div class='kpi-value'>{fmt(metrics['R2'])}</div></div>", unsafe_allow_html=True)
+    # Single-number accuracy (prefer WAPE; fallback to MAPE)
+    acc_pct = np.nan
+    if not pd.isna(metrics.get("WAPE", np.nan)):
+        acc_pct = max(0.0, min(100.0, (1.0 - metrics["WAPE"]) * 100.0))
+    elif not pd.isna(metrics.get("MAPE", np.nan)):
+        acc_pct = max(0.0, min(100.0, (1.0 - metrics["MAPE"]) * 100.0))
 
-    if bt.empty:
-        st.info("Not enough historical data to backtest with the chosen settings.")
-    else:
-        st.altair_chart(accuracy_scatter(bt), use_container_width=True)
-        with st.expander("Backtest details"):
-            show = bt.copy()
-            for c in ["Forecast","Actual","Error","AbsError","SqError"]:
-                show[c] = show[c].round(2)
-            if show["APE"].notna().any():
-                show["APE%"] = (show["APE"]*100).round(1)
-            st.dataframe(show.drop(columns=["APE"]), use_container_width=True)
+    st.markdown(
+        f"<div class='kpi-card'><div class='kpi-title'>Model Accuracy (100 − WAPE)</div>"
+        f"<div class='kpi-value'>{'–' if pd.isna(acc_pct) else f'{acc_pct:.1f}%'}"
+        f"</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    # Optional detail toggle
+    show_details = st.checkbox("Show detailed metrics", value=False)
+
+    if show_details:
+        m1, m2, m3, m4, m5 = st.columns(5)
+        def fmt(x, pct=False):
+            if pd.isna(x): return "–"
+            return f"{x*100:.1f}%" if pct else f"{x:.2f}"
+        with m1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAPE</div><div class='kpi-value'>{fmt(metrics['MAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
+        with m2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>WAPE</div><div class='kpi-value'>{fmt(metrics['WAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
+        with m3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAE</div><div class='kpi-value'>{fmt(metrics['MAE'])}</div></div>", unsafe_allow_html=True)
+        with m4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>RMSE</div><div class='kpi-value'>{fmt(metrics['RMSE'])}</div></div>", unsafe_allow_html=True)
+        with m5: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>R²</div><div class='kpi-value'>{fmt(metrics['R2'])}</div></div>", unsafe_allow_html=True)
+
+        if bt.empty:
+            st.info("Not enough historical data to backtest with the chosen settings.")
+        else:
+            st.altair_chart(accuracy_scatter(bt), use_container_width=True)
+            with st.expander("Backtest details"):
+                show = bt.copy()
+                for c in ["Forecast","Actual","Error","AbsError","SqError"]:
+                    show[c] = show[c].round(2)
+                if show["APE"].notna().any():
+                    show["APE%"] = (show["APE"]*100).round(1)
+                st.dataframe(show.drop(columns=["APE"]), use_container_width=True)
 
 # Optional: data preview
 with st.expander("Data preview & column mapping", expanded=False):
@@ -972,61 +995,3 @@ with st.expander("Data preview & column mapping", expanded=False):
         "Deal Stage": dealstage_col or "Not found",
     })
     st.dataframe(df.head(20))
-# ----- Model Accuracy (Backtest) -----
-st.subheader("Model Accuracy")
-
-colb1, colb2 = st.columns([1,3])
-with colb1:
-    backtest_k = st.selectbox(
-        "Backtest months",
-        [3, 6, 12], index=0,
-        help="How many recent months to evaluate (excluding current)."
-    )
-with colb2:
-    st.caption("Each backtested month is forecast using only the prior lookback window and compared to actual.")
-
-bt, metrics = backtest_accuracy(
-    df_f, create_col, pay_col, source_col,
-    lookback=lookback, weighted=weighted,
-    backtest_months=backtest_k, today=today
-)
-
-# Single-number accuracy (prefer WAPE; fallback to MAPE)
-acc_pct = np.nan
-if not pd.isna(metrics.get("WAPE", np.nan)):
-    acc_pct = max(0.0, min(100.0, (1.0 - metrics["WAPE"]) * 100.0))
-elif not pd.isna(metrics.get("MAPE", np.nan)):
-    acc_pct = max(0.0, min(100.0, (1.0 - metrics["MAPE"]) * 100.0))
-
-st.markdown(
-    f"<div class='kpi-card'><div class='kpi-title'>Model Accuracy (100 − WAPE)</div>"
-    f"<div class='kpi-value'>{'–' if pd.isna(acc_pct) else f'{acc_pct:.1f}%'}"
-    f"</div></div>",
-    unsafe_allow_html=True,
-)
-
-# Optional detail toggle
-show_details = st.checkbox("Show detailed metrics", value=False)
-
-if show_details:
-    m1, m2, m3, m4, m5 = st.columns(5)
-    def fmt(x, pct=False):
-        if pd.isna(x): return "–"
-        return f"{x*100:.1f}%" if pct else f"{x:.2f}"
-    with m1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAPE</div><div class='kpi-value'>{fmt(metrics['MAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
-    with m2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>WAPE</div><div class='kpi-value'>{fmt(metrics['WAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
-    with m3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAE</div><div class='kpi-value'>{fmt(metrics['MAE'])}</div></div>", unsafe_allow_html=True)
-    with m4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>RMSE</div><div class='kpi-value'>{fmt(metrics['RMSE'])}</div></div>", unsafe_allow_html=True)
-    with m5: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>R²</div><div class='kpi-value'>{fmt(metrics['R2'])}</div></div>", unsafe_allow_html=True)
-
-    if bt.empty:
-        st.info("Not enough historical data to backtest with the chosen settings.")
-    else:
-        st.altair_chart(accuracy_scatter(bt), use_container_width=True)
-        with st.expander("Backtest details"):
-            show = bt.copy()
-            for c in ["Forecast","Actual","Error","AbsError","SqError"]:
-                show[c] = show[c].round(2)
-            if show["APE"].notna().any():
-                show["APE%"] = (show["APE"]*100).round(1)
-            st.dataframe(show.drop(columns=["APE"]), use_container_width=True)
