@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 import re
 from calendar import monthrange
 
@@ -276,7 +276,7 @@ with st.expander("Filters", expanded=False):
     with col_bottom_right:
         st.empty()
 
-# Apply filters and Track filter
+# Apply global filters and Track filter
 df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellors, sel_countries, sel_sources)
 
 if track != "Both":
@@ -951,7 +951,7 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# NEW: Trend & Analysis
+# NEW: Trend & Analysis (no redundant filters; uses global Filters)
 # ----------------------------
 def group_trend_analysis(
     df_scope: pd.DataFrame,
@@ -981,7 +981,7 @@ def group_trend_analysis(
     # Denominator definition
     den_mask = create_mask
 
-    # Produce grouped counts
+    # Group safely
     g_vals = d[group_col].astype(str).fillna("Unknown")
 
     payments_by_group = g_vals[num_mask].value_counts().rename("Count_Payments")
@@ -1009,57 +1009,25 @@ def group_trend_analysis(
 if view == "Trend & Analysis":
     st.subheader("Trend & Analysis – Grouped Drilldowns")
 
-    # Page-level filters (scoped to this page, start from df_f)
+    # This page **only** reuses global filtered df_f (no redundant filters here)
     df_page = df_f.copy()
 
-    # Build option helpers safely
-    def opts(series: pd.Series):
-        return ["All"] + sorted([str(v) for v in series.dropna().unique()])
+    # Controls
+    col1, col2, col3, col4 = st.columns([1.2, 1.2, 1.2, 1.0])
+    with col1:
+        group_by_label = st.selectbox("Group by", ["Academic Counsellor", "Country", "Deal Source"], index=0)
+    with col2:
+        level = st.radio("Level", ["MTD", "Cohort"], index=0, horizontal=True)
+    with col3:
+        pay_start = st.date_input("Payments period start", value=this_m_start, key="ta_pay_start")
+    with col4:
+        pay_end   = st.date_input("Payments period end (inclusive)", value=this_m_end, key="ta_pay_end")
 
-    with st.container():
-        col1, col2, col3, col4 = st.columns([1.2, 1.2, 1.2, 1.0])
-
-        with col1:
-            group_by_label = st.selectbox("Group by", ["Academic Counsellor", "Country", "Deal Source"], index=0)
-        with col2:
-            level = st.radio("Level", ["MTD", "Cohort"], index=0, horizontal=True)
-        with col3:
-            pay_start = st.date_input("Payments period start", value=this_m_start, key="ta_pay_start")
-        with col4:
-            pay_end   = st.date_input("Payments period end (inclusive)", value=this_m_end, key="ta_pay_end")
-
-        col5, col6 = st.columns(2)
-        with col5:
-            create_start = st.date_input("Create-date period start", value=this_m_start, key="ta_create_start")
-        with col6:
-            create_end   = st.date_input("Create-date period end (inclusive)", value=this_m_end, key="ta_create_end")
-
-        st.caption("Below filters apply **only on this page** in addition to the global filters above.")
-
-        f1, f2, f3 = st.columns(3)
-        if counsellor_col:
-            with f1:
-                page_counsellors = st.multiselect("Academic Counsellor (page)", options=opts(df[counsellor_col]), default=["All"])
-        else:
-            page_counsellors = []
-        if country_col:
-            with f2:
-                page_countries = st.multiselect("Country (page)", options=opts(df[country_col]), default=["All"])
-        else:
-            page_countries = []
-        if source_col:
-            with f3:
-                page_sources = st.multiselect("JetLearn Deal Source (page)", options=opts(df[source_col]), default=["All"])
-        else:
-            page_sources = []
-
-    # apply page-level filters
-    if counsellor_col and page_counsellors and "All" not in page_counsellors:
-        df_page = df_page[df_page[counsellor_col].astype(str).isin(page_counsellors)]
-    if country_col and page_countries and "All" not in page_countries:
-        df_page = df_page[df_page[country_col].astype(str).isin(page_countries)]
-    if source_col and page_sources and "All" not in page_sources:
-        df_page = df_page[df_page[source_col].astype(str).isin(page_sources)]
+    col5, col6 = st.columns(2)
+    with col5:
+        create_start = st.date_input("Create-date period start", value=this_m_start, key="ta_create_start")
+    with col6:
+        create_end   = st.date_input("Create-date period end (inclusive)", value=this_m_end, key="ta_create_end")
 
     # validation
     if pay_end < pay_start:
@@ -1067,7 +1035,6 @@ if view == "Trend & Analysis":
     elif create_end < create_start:
         st.error("Create-date period end cannot be before start.")
     else:
-        # Map label to actual column
         group_col_map = {
             "Academic Counsellor": counsellor_col,
             "Country": country_col,
@@ -1085,12 +1052,10 @@ if view == "Trend & Analysis":
                 create_col, pay_col
             )
 
-            # Output table
             st.markdown("### Output")
             if tbl.empty:
                 st.info("No rows match the selected filters and date ranges.")
             else:
-                # Nicely format
                 show = tbl.copy()
                 show["Conversion%"] = show["Conversion%"].map(lambda x: f"{x:.1f}%")
                 st.dataframe(show.rename(columns={"Group": group_by_label}), use_container_width=True)
@@ -1109,15 +1074,13 @@ if view == "Trend & Analysis":
                     st.altair_chart(chart1, use_container_width=True)
 
                 with c2:
-                    top_conv = tbl.copy()
-                    chart2 = alt.Chart(top_conv).mark_bar().encode(
+                    chart2 = alt.Chart(tbl).mark_bar().encode(
                         x=alt.X("Conversion%:Q", title="Conversion %"),
                         y=alt.Y("Group:N", sort="-x", title=group_by_label),
                         tooltip=[alt.Tooltip("Group:N"), alt.Tooltip("Conversion%:Q")]
                     ).properties(height=360, title="Conversion% by group")
                     st.altair_chart(chart2, use_container_width=True)
 
-                # Download
                 csv = tbl.to_csv(index=False).encode("utf-8")
                 st.download_button("Download CSV (Trend & Analysis)", data=csv, file_name="trend_analysis.csv", mime="text/csv")
 
