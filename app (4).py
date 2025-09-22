@@ -160,7 +160,7 @@ def exclude_invalid_deals(df: pd.DataFrame, dealstage_col: str | None) -> tuple[
 # ----------------------------
 # Session state for data path (default)
 # ----------------------------
-DEFAULT_DATA_PATH = "Master_sheet_DB.csv"
+DEFAULT_DATA_PATH = "Master_sheet-DB.csv"
 if "data_src" not in st.session_state:
     st.session_state["data_src"] = DEFAULT_DATA_PATH
 
