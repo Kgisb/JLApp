@@ -64,11 +64,9 @@ PALETTE = {
     "ThresholdLow": "#f3f4f6",
     "ThresholdMid": "#e5e7eb",
     "ThresholdHigh": "#d1d5db",
-
-    # Predictibility
-    "A_actual": "#2563eb",          # blue
-    "Rem_prev": "#6b7280",          # gray
-    "Rem_same": "#16a34a",          # green
+    "A_actual": "#2563eb",   # blue
+    "Rem_prev": "#6b7280",   # gray
+    "Rem_same": "#16a34a",   # green
 }
 
 # ----------------------------
@@ -167,12 +165,12 @@ if "data_src" not in st.session_state:
 with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio("Go to", ["MIS", "Predictibility", "Trend & Analysis"], index=0)
-    track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)  # Track toggle
-    st.caption("Use MIS for status; Predictibility for month-end forecast (A/B/C) & accuracy; Trend & Analysis for grouped drilldowns.")
+    track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)
+    st.caption("Use MIS for status; Predictibility for forecast & accuracy; Trend & Analysis for grouped drilldowns.")
 
 st.title("📊 JetLearn MIS")
 
-# Legend pills show only active series
+# Legend pills follow Track
 def active_labels(track: str) -> list[str]:
     if track == "AI Coding":
         return ["Total", "AI Coding"]
@@ -186,10 +184,7 @@ pill_map = {
     "AI Coding": "<span class='legend-pill pill-ai'>AI-Coding</span>",
     "Math": "<span class='legend-pill pill-math'>Math</span>",
 }
-st.markdown(
-    "<div>" + "".join(pill_map[l] for l in legend_labels) + "</div>",
-    unsafe_allow_html=True,
-)
+st.markdown("<div>" + "".join(pill_map[l] for l in legend_labels) + "</div>", unsafe_allow_html=True)
 st.write("Visualizes **Enrolments (Payments)**, **Conversion%**, **Trend**, **Predictibility**, and **Drilldowns** with **Model Accuracy**.")
 
 # ----------------------------
@@ -230,7 +225,7 @@ last_m_start, last_m_end = last_month_bounds(today)
 this_m_start, this_m_end = month_bounds(today)
 
 # ----------------------------
-# Filters expander (collapsed) with data path bottom-left
+# Filters expander (collapsed) + data path bottom-left
 # ----------------------------
 def _update_data_src():
     st.session_state["data_src"] = st.session_state.get("data_src_input", DEFAULT_DATA_PATH)
@@ -276,7 +271,7 @@ with st.expander("Filters", expanded=False):
     with col_bottom_right:
         st.empty()
 
-# Apply global filters and Track filter
+# Apply global filters + Track
 df_f = apply_filters(df, counsellor_col, country_col, source_col, sel_counsellors, sel_countries, sel_sources)
 
 if track != "Both":
@@ -404,7 +399,7 @@ def prepare_conversion_for_range(
     return mtd_pct, coh_pct, denoms, numerators
 
 # ----------------------------
-# MIS visuals (track-aware)
+# Visuals
 # ----------------------------
 def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int, labels: list[str] = None):
     all_rows = [
@@ -417,11 +412,7 @@ def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int, labe
     data = pd.DataFrame([r for r in all_rows if r["Label"] in labels])
 
     color_domain = labels
-    color_range_map = {
-        "Total": PALETTE["Total"],
-        "AI Coding": PALETTE["AI Coding"],
-        "Math": PALETTE["Math"],
-    }
+    color_range_map = {"Total": PALETTE["Total"], "AI Coding": PALETTE["AI Coding"], "Math": PALETTE["Math"]}
     color_range = [color_range_map[l] for l in labels]
 
     base = alt.Chart(data).encode(
@@ -500,10 +491,7 @@ def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict, labels: list[
 
     for label in order:
         series_color = {"Total": PALETTE["Total"], "AI Coding": PALETTE["AI Coding"], "Math": PALETTE["Math"]}[label]
-        st.altair_chart(
-            bullet_gauge(pcts[label], label, series_color, nums.get(label,0), denoms.get(label,0)),
-            use_container_width=True
-        )
+        st.altair_chart(bullet_gauge(pcts[label], label, series_color, nums.get(label,0), denoms.get(label,0)), use_container_width=True)
 
 def trend_timeseries(
     df: pd.DataFrame,
@@ -567,28 +555,24 @@ def trend_timeseries(
 
 def trend_chart(ts: pd.DataFrame, title: str):
     base = alt.Chart(ts).encode(x=alt.X("Date:T", axis=alt.Axis(title=None)))
-
     bars = base.mark_bar(opacity=0.75).encode(
         y=alt.Y("Leads:Q", axis=alt.Axis(title="Leads (deals created)")),
         tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Leads:Q")]
     ).properties(height=260)
-
     line_mtd = base.mark_line(point=True).encode(
         y=alt.Y("MTD:Q", axis=alt.Axis(title="Enrolments"), scale=alt.Scale(zero=True)),
         color=alt.value(PALETTE["AI Coding"]),
         tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("MTD:Q", title="MTD Enrolments")]
     )
-
     line_coh = base.mark_line(point=True).encode(
         y=alt.Y("Cohort:Q", axis=alt.Axis(title="Enrolments"), scale=alt.Scale(zero=True)),
         color=alt.value(PALETTE["Math"]),
         tooltip=[alt.Tooltip("Date:T"), alt.Tooltip("Cohort:Q", title="Cohort Enrolments")]
     )
-
     return alt.layer(bars, line_mtd, line_coh).resolve_scale(y='independent').properties(title=title)
 
 # ----------------------------
-# Predictibility core (A/B/C via lookback daily rates) + Accuracy
+# Predictibility + Accuracy
 # ----------------------------
 def add_month_cols(df: pd.DataFrame, create_col: str, pay_col: str) -> pd.DataFrame:
     d = df.copy()
@@ -641,7 +625,6 @@ def daily_rates_from_lookback(d_hist: pd.DataFrame, source_col: str, lookback: i
     den_o = w_all.sum()
     overall_same_rate = float(num_same_o/den_o) if den_o > 0 else 0.0
     overall_prev_rate = float(num_prev_o/den_o) if den_o > 0 else 0.0
-
     return rates_same, rates_prev, overall_same_rate, overall_prev_rate
 
 def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, source_col: str,
@@ -722,20 +705,12 @@ def predict_chart_stacked(tbl: pd.DataFrame):
         var_name="Component",
         value_name="Value"
     )
-    color_map = {
-        "A_Actual_ToDate": PALETTE["A_actual"],
-        "B_Remaining_SameMonth": PALETTE["Rem_same"],
-        "C_Remaining_PrevMonths": PALETTE["Rem_prev"],
-    }
+    color_map = {"A_Actual_ToDate": PALETTE["A_actual"], "B_Remaining_SameMonth": PALETTE["Rem_same"], "C_Remaining_PrevMonths": PALETTE["Rem_prev"]}
     chart = alt.Chart(melt).mark_bar().encode(
         x=alt.X("Source:N", sort=alt.SortField("Source")),
         y=alt.Y("Value:Q", stack=True),
-        color=alt.Color("Component:N",
-                        scale=alt.Scale(domain=list(color_map.keys()), range=list(color_map.values())),
-                        legend=alt.Legend(title="Component", orient="top", labelLimit=240)),
-        tooltip=[alt.Tooltip("Source:N"),
-                 alt.Tooltip("Component:N"),
-                 alt.Tooltip("Value:Q", format=",.1f")]
+        color=alt.Color("Component:N", scale=alt.Scale(domain=list(color_map.keys()), range=list(color_map.values())), legend=alt.Legend(title="Component", orient="top", labelLimit=240)),
+        tooltip=[alt.Tooltip("Source:N"), alt.Tooltip("Component:N"), alt.Tooltip("Value:Q", format=",.1f")]
     ).properties(height=360, title="Predictibility (A + B + C = Projected Month-End)")
     return chart
 
@@ -790,12 +765,9 @@ def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_
 
         err = forecast - actual_total
         rows.append({
-            "Month": str(m),
-            "Days": days_in_m,
-            "Forecast": float(forecast),
-            "Actual": float(actual_total),
-            "Error": float(err),
-            "AbsError": float(abs(err)),
+            "Month": str(m), "Days": days_in_m,
+            "Forecast": float(forecast), "Actual": float(actual_total),
+            "Error": float(err), "AbsError": float(abs(err)),
             "SqError": float(err**2),
             "APE": float(abs(err) / actual_total) if actual_total > 0 else np.nan
         })
@@ -811,9 +783,7 @@ def backtest_accuracy(df_f: pd.DataFrame, create_col: str, pay_col: str, source_
     ss_res = ((bt["Actual"] - bt["Forecast"])**2).sum()
     ss_tot = ((bt["Actual"] - bt["Actual"].mean())**2).sum()
     r2 = 1 - ss_res/ss_tot if ss_tot > 0 else np.nan
-
-    metrics = {"MAPE": mape, "WAPE": wape, "MAE": mae, "RMSE": rmse, "R2": r2}
-    return bt, metrics
+    return bt, {"MAPE": mape, "WAPE": wape, "MAE": mae, "RMSE": rmse, "R2": r2}
 
 def accuracy_scatter(bt: pd.DataFrame):
     if bt.empty:
@@ -828,7 +798,7 @@ def accuracy_scatter(bt: pd.DataFrame):
     return chart + line
 
 # ----------------------------
-# MIS section helpers (track-aware rendering)
+# MIS section helpers
 # ----------------------------
 def render_period_block(
     df_scope: pd.DataFrame,
@@ -850,23 +820,13 @@ def render_period_block(
 
     c1, c2 = st.columns(2)
     with c1:
-        st.altair_chart(
-            bubble_chart_counts(
-                "MTD Enrolments (counts)",
-                mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"],
-                labels=labels,
-            ),
-            use_container_width=True
-        )
+        st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)",
+                                            mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"],
+                                            labels=labels), use_container_width=True)
     with c2:
-        st.altair_chart(
-            bubble_chart_counts(
-                "Cohort Enrolments (counts)",
-                coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"],
-                labels=labels,
-            ),
-            use_container_width=True
-        )
+        st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)",
+                                            coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"],
+                                            labels=labels), use_container_width=True)
 
     mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
         df_scope, range_start, range_end, create_col, pay_col, pipeline_col,
@@ -877,11 +837,9 @@ def render_period_block(
     bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms, labels=labels)
     bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms, labels=labels)
 
-    ts = trend_timeseries(
-        df_scope, range_start, range_end,
-        denom_mode="anchor", running_month_anchor=running_month_anchor,
-        create_col=create_col, pay_col=pay_col
-    )
+    ts = trend_timeseries(df_scope, range_start, range_end,
+                          denom_mode="anchor", running_month_anchor=running_month_anchor,
+                          create_col=create_col, pay_col=pay_col)
     st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
@@ -951,7 +909,7 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# NEW: Trend & Analysis (no redundant filters; uses global Filters)
+# Trend & Analysis (reuses global Filters only)
 # ----------------------------
 def group_trend_analysis(
     df_scope: pd.DataFrame,
@@ -972,18 +930,11 @@ def group_trend_analysis(
     pay_mask = d["_pay_dt"].between(pay_start, pay_end)
     create_mask = d["_create_dt"].between(create_start, create_end)
 
-    # Numerator definition
-    if level == "MTD":
-        num_mask = pay_mask & create_mask
-    else:  # Cohort
-        num_mask = pay_mask
-
-    # Denominator definition
+    # Numerators
+    num_mask = (pay_mask & create_mask) if level == "MTD" else pay_mask
     den_mask = create_mask
 
-    # Group safely
     g_vals = d[group_col].astype(str).fillna("Unknown")
-
     payments_by_group = g_vals[num_mask].value_counts().rename("Count_Payments")
     created_by_group  = g_vals[den_mask].value_counts().rename("Count_Created")
 
@@ -999,20 +950,15 @@ def group_trend_analysis(
             return 0.0
         return round(100.0 * n / d, 1)
 
-    result["Conversion%"] = [
-        pct(result.loc[g, "Count_Payments"], result.loc[g, "Count_Created"]) for g in result.index
-    ]
-
+    result["Conversion%"] = [pct(result.loc[g, "Count_Payments"], result.loc[g, "Count_Created"]) for g in result.index]
     result = result.reset_index()
     return result.sort_values(["Count_Payments", "Count_Created"], ascending=[False, False])
 
 if view == "Trend & Analysis":
     st.subheader("Trend & Analysis – Grouped Drilldowns")
 
-    # This page **only** reuses global filtered df_f (no redundant filters here)
-    df_page = df_f.copy()
+    df_page = df_f.copy()  # reuse global filters only
 
-    # Controls
     col1, col2, col3, col4 = st.columns([1.2, 1.2, 1.2, 1.0])
     with col1:
         group_by_label = st.selectbox("Group by", ["Academic Counsellor", "Country", "Deal Source"], index=0)
@@ -1029,7 +975,6 @@ if view == "Trend & Analysis":
     with col6:
         create_end   = st.date_input("Create-date period end (inclusive)", value=this_m_end, key="ta_create_end")
 
-    # validation
     if pay_end < pay_start:
         st.error("Payments period end cannot be before start.")
     elif create_end < create_start:
@@ -1045,12 +990,7 @@ if view == "Trend & Analysis":
         if not group_col:
             st.warning(f"Column for '{group_by_label}' not found in your data.")
         else:
-            tbl = group_trend_analysis(
-                df_page, group_col, level,
-                pay_start, pay_end,
-                create_start, create_end,
-                create_col, pay_col
-            )
+            tbl = group_trend_analysis(df_page, group_col, level, pay_start, pay_end, create_start, create_end, create_col, pay_col)
 
             st.markdown("### Output")
             if tbl.empty:
@@ -1060,10 +1000,8 @@ if view == "Trend & Analysis":
                 show["Conversion%"] = show["Conversion%"].map(lambda x: f"{x:.1f}%")
                 st.dataframe(show.rename(columns={"Group": group_by_label}), use_container_width=True)
 
-                # Quick charts
                 st.markdown("#### Quick charts")
                 c1, c2 = st.columns(2)
-
                 with c1:
                     top_pay = tbl.nlargest(15, "Count_Payments")
                     chart1 = alt.Chart(top_pay).mark_bar().encode(
@@ -1072,7 +1010,6 @@ if view == "Trend & Analysis":
                         tooltip=[alt.Tooltip("Group:N"), alt.Tooltip("Count_Payments:Q")]
                     ).properties(height=360, title="Top groups by Payments")
                     st.altair_chart(chart1, use_container_width=True)
-
                 with c2:
                     chart2 = alt.Chart(tbl).mark_bar().encode(
                         x=alt.X("Conversion%:Q", title="Conversion %"),
@@ -1085,26 +1022,18 @@ if view == "Trend & Analysis":
                 st.download_button("Download CSV (Trend & Analysis)", data=csv, file_name="trend_analysis.csv", mime="text/csv")
 
 # ----------------------------
-# Predictibility (A/B/C) + Model Accuracy (tied to lookback)
+# Predictibility (view)
 # ----------------------------
 if view == "Predictibility":
     st.subheader("Predictibility – Running Month Enrolment Forecast")
-    st.caption(
-        "A = payments received **to date** in the running month. "
-        "B = forecast for remaining days from **same-month created** deals (lookback daily rate). "
-        "C = forecast for remaining days from **previous-months created** deals (lookback daily rate). "
-        "Projected month-end = A + B + C."
-    )
-
+    st.caption("A = payments to date; B = remaining (same-month created rate); C = remaining (prev-months created rate).")
     colp1, colp2, colp3 = st.columns([1,1,2])
     with colp1:
         lookback = st.selectbox("Lookback window (months)", [3, 6, 12], index=0)
     with colp2:
-        st.markdown("**Averaging:** Recency-weighted")
-        st.caption("Uses weights 1..K across the last K pay-months (most recent has highest weight).")
-        weighted = True
+        st.markdown("**Averaging:** Recency-weighted"); weighted = True
     with colp3:
-        st.info("Daily rates are computed per source from the last K pay-months (excluding current).")
+        st.info("Rates computed per source over the last K pay-months (excluding current).")
 
     cur_start, cur_end = month_bounds(today)
     d_preview = add_month_cols(df_f, create_col, pay_col)
@@ -1115,20 +1044,15 @@ if view == "Predictibility":
     tbl, totals = predict_running_month(df_f, create_col, pay_col, source_col, lookback, weighted, today)
 
     c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>A · Actual to date</div><div class='kpi-value' style='color:{PALETTE['A_actual']}'>{totals['A_Actual_ToDate']:.1f}</div></div>", unsafe_allow_html=True)
-    with c2:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>B · Remaining (same-month)</div><div class='kpi-value' style='color:{PALETTE['Rem_same']}'>{totals['B_Remaining_SameMonth']:.1f}</div></div>", unsafe_allow_html=True)
-    with c3:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>C · Remaining (prev-months)</div><div class='kpi-value' style='color:{PALETTE['Rem_prev']}'>{totals['C_Remaining_PrevMonths']:.1f}</div></div>", unsafe_allow_html=True)
-    with c4:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Projected Month-End</div><div class='kpi-value' style='color:{PALETTE['Total']}'>{totals['Projected_MonthEnd_Total']:.1f}</div><div class='kpi-sub'>A + B + C</div></div>", unsafe_allow_html=True)
+    with c1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>A · Actual to date</div><div class='kpi-value' style='color:{PALETTE['A_actual']}'>{totals['A_Actual_ToDate']:.1f}</div></div>", unsafe_allow_html=True)
+    with c2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>B · Remaining (same-month)</div><div class='kpi-value' style='color:{PALETTE['Rem_same']}'>{totals['B_Remaining_SameMonth']:.1f}</div></div>", unsafe_allow_html=True)
+    with c3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>C · Remaining (prev-months)</div><div class='kpi-value' style='color:{PALETTE['Rem_prev']}'>{totals['C_Remaining_PrevMonths']:.1f}</div></div>", unsafe_allow_html=True)
+    with c4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Projected Month-End</div><div class='kpi-value' style='color:{PALETTE['Total']}'>{totals['Projected_MonthEnd_Total']:.1f}</div><div class='kpi-sub'>A + B + C</div></div>", unsafe_allow_html=True)
 
     st.altair_chart(predict_chart_stacked(tbl), use_container_width=True)
 
     with st.expander("Detailed table (by source)"):
-        show_cols = ["Source","A_Actual_ToDate","B_Remaining_SameMonth","C_Remaining_PrevMonths",
-                     "Projected_MonthEnd_Total","Rate_Same_Daily","Rate_Prev_Daily","Remaining_Days"]
+        show_cols = ["Source","A_Actual_ToDate","B_Remaining_SameMonth","C_Remaining_PrevMonths","Projected_MonthEnd_Total","Rate_Same_Daily","Rate_Prev_Daily","Remaining_Days"]
         if not tbl.empty:
             view_tbl = tbl[show_cols].copy()
             for c in ["B_Remaining_SameMonth","C_Remaining_PrevMonths","Projected_MonthEnd_Total","Rate_Same_Daily","Rate_Prev_Daily"]:
@@ -1140,40 +1064,23 @@ if view == "Predictibility":
             st.info("No data in scope for the running month after filters.")
 
     st.subheader("Model Accuracy")
-    st.caption(f"Accuracy is computed using a rolling backtest over the same lookback window you selected above (**{lookback} months**).")
-
-    bt, metrics = backtest_accuracy(
-        df_f, create_col, pay_col, source_col,
-        lookback=lookback, weighted=weighted,
-        backtest_months=lookback,
-        today=today
-    )
-
+    bt, metrics = backtest_accuracy(df_f, create_col, pay_col, source_col, lookback=lookback, weighted=True, backtest_months=lookback, today=date.today())
     acc_pct = np.nan
     if not pd.isna(metrics.get("WAPE", np.nan)):
         acc_pct = max(0.0, min(100.0, (1.0 - metrics["WAPE"]) * 100.0))
     elif not pd.isna(metrics.get("MAPE", np.nan)):
         acc_pct = max(0.0, min(100.0, (1.0 - metrics["MAPE"]) * 100.0))
-
-    st.markdown(
-        f"<div class='kpi-card'><div class='kpi-title'>Model Accuracy (100 − WAPE)</div>"
-        f"<div class='kpi-value'>{'–' if pd.isna(acc_pct) else f'{acc_pct:.1f}%'}"
-        f"</div></div>",
-        unsafe_allow_html=True,
-    )
+    st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Model Accuracy (100 − WAPE)</div><div class='kpi-value'>{'–' if pd.isna(acc_pct) else f'{acc_pct:.1f}%'}</div></div>", unsafe_allow_html=True)
 
     show_details = st.checkbox("Show detailed metrics", value=False)
     if show_details:
         m1, m2, m3, m4, m5 = st.columns(5)
-        def fmt(x, pct=False):
-            if pd.isna(x): return "–"
-            return f"{x*100:.1f}%" if pct else f"{x:.2f}"
+        def fmt(x, pct=False): return "–" if pd.isna(x) else (f"{x*100:.1f}%" if pct else f"{x:.2f}")
         with m1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAPE</div><div class='kpi-value'>{fmt(metrics['MAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
         with m2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>WAPE</div><div class='kpi-value'>{fmt(metrics['WAPE'], pct=True)}</div></div>", unsafe_allow_html=True)
         with m3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>MAE</div><div class='kpi-value'>{fmt(metrics['MAE'])}</div></div>", unsafe_allow_html=True)
         with m4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>RMSE</div><div class='kpi-value'>{fmt(metrics['RMSE'])}</div></div>", unsafe_allow_html=True)
         with m5: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>R²</div><div class='kpi-value'>{fmt(metrics['R2'])}</div></div>", unsafe_allow_html=True)
-
         if bt.empty:
             st.info("Not enough historical data to backtest with the chosen settings.")
         else:
