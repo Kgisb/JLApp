@@ -938,9 +938,6 @@ def group_trend_analysis(
     pay_mask = d["_pay_dt"].between(pay_start, pay_end)
     create_mask = d["_create_dt"].between(create_start, create_end)
 
-    # Numerator:
-    #  - MTD: payments in pay-window AND created in create-window
-    #  - Cohort: payments in pay-window (denominator is create-window)
     num_mask = (pay_mask & create_mask) if level == "MTD" else pay_mask
     den_mask = create_mask
 
@@ -990,12 +987,10 @@ if view == "Trend & Analysis":
     with col4:
         pay_end   = st.date_input("Payments period end (inclusive)", value=this_m_end, key="ta_pay_end")
 
-    # --- Cohort full-history lock (checkbox + optional reset) ---
-    if "ta_lock_full_history" not in st.session_state:
-        st.session_state["ta_lock_full_history"] = True  # default locked
+    # --- Cohort full-history lock (no manual pre-setting of this key!) ---
+    lock_default = st.session_state.get("ta_lock_full_history", True)
 
-    # Track create-date selections in session_state so reset/unlock works smoothly
-    # Different keys for cohort vs mtd
+    # Session keys to persist date selections
     if "ta_create_start_cohort" not in st.session_state:
         st.session_state["ta_create_start_cohort"] = hist_min_date
     if "ta_create_end_cohort" not in st.session_state:
@@ -1005,41 +1000,44 @@ if view == "Trend & Analysis":
     if "ta_create_end_mtd" not in st.session_state:
         st.session_state["ta_create_end_mtd"] = this_m_end
 
-    # If Level toggles to Cohort and lock is on, ensure session values reflect full history
-    if level == "Cohort" and st.session_state["ta_lock_full_history"]:
+    # If Level toggles to Cohort and lock currently True, align to full history (without writing the lock key here)
+    if level == "Cohort" and lock_default:
         st.session_state["ta_create_start_cohort"] = hist_min_date
         st.session_state["ta_create_end_cohort"] = hist_max_date
 
     # UI for create-date period
     col5, col6 = st.columns(2)
     if level == "Cohort":
-        lock = st.checkbox("Lock create-date to full history (Cohort)", value=st.session_state["ta_lock_full_history"], key="ta_lock_full_history")
+        lock = st.checkbox(
+            "Lock create-date to full history (Cohort)",
+            key="ta_lock_full_history",
+            value=lock_default,
+        )
         with col5:
             create_start = st.date_input(
                 "Create-date period start",
                 value=st.session_state["ta_create_start_cohort"],
                 key="ta_create_start_cohort_input",
-                disabled=st.session_state["ta_lock_full_history"],
+                disabled=st.session_state.get("ta_lock_full_history", True),
             )
         with col6:
             create_end = st.date_input(
                 "Create-date period end (inclusive)",
                 value=st.session_state["ta_create_end_cohort"],
                 key="ta_create_end_cohort_input",
-                disabled=st.session_state["ta_lock_full_history"],
+                disabled=st.session_state.get("ta_lock_full_history", True),
             )
 
-        # When locked, force full history in variables
-        if st.session_state["ta_lock_full_history"]:
+        # When locked, force full history (local variables only)
+        if st.session_state.get("ta_lock_full_history", True):
             create_start = hist_min_date
             create_end = hist_max_date
-
-        # Persist unlocked edits to session
         else:
+            # Persist unlocked edits
             st.session_state["ta_create_start_cohort"] = create_start
             st.session_state["ta_create_end_cohort"] = create_end
 
-        # Reset button (always visible)
+        # Reset button safely updates widget keys then reruns
         if st.button("Reset to full history"):
             st.session_state["ta_create_start_cohort"] = hist_min_date
             st.session_state["ta_create_end_cohort"] = hist_max_date
