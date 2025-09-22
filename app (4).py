@@ -166,7 +166,7 @@ with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio("Go to", ["MIS", "Predictibility", "Trend & Analysis"], index=0)
     track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)
-    st.caption("Use MIS for status; Predictibility for forecast & accuracy; Trend & Analysis for grouped drilldowns.")
+    st.caption("Use MIS for status (MTD up to today); Predictibility for forecast; Trend & Analysis for grouped drilldowns.")
 
 st.title("📊 JetLearn MIS")
 
@@ -222,7 +222,8 @@ if missing_create > 0:
 today = date.today()
 yday = today - timedelta(days=1)
 last_m_start, last_m_end = last_month_bounds(today)
-this_m_start, this_m_end = month_bounds(today)
+this_m_start, this_m_end = month_bounds(today)  # month bounds (1st .. last day)
+this_m_end_mtd = today                           # >>> MIS uses running MTD end (= today)
 
 # ----------------------------
 # Filters expander (collapsed) + data path bottom-left
@@ -857,9 +858,10 @@ if view == "MIS":
         with colB:
             render_period_block(df_f, "Today", today, today, today, create_col, pay_col, pipeline_col, track)
             st.divider()
-            render_period_block(df_f, "This Month", this_m_start, this_m_end, this_m_start, create_col, pay_col, pipeline_col, track)
+            # >>> This Month = 1st .. TODAY (running MTD)
+            render_period_block(df_f, "This Month (MTD)", this_m_start, this_m_end_mtd, this_m_start, create_col, pay_col, pipeline_col, track)
     else:
-        tabs = st.tabs(["Yesterday", "Today", "Last Month", "This Month", "Custom"])
+        tabs = st.tabs(["Yesterday", "Today", "Last Month", "This Month (MTD)", "Custom"])
         with tabs[0]:
             render_period_block(df_f, "Yesterday", yday, yday, yday, create_col, pay_col, pipeline_col, track)
         with tabs[1]:
@@ -867,7 +869,8 @@ if view == "MIS":
         with tabs[2]:
             render_period_block(df_f, "Last Month", last_m_start, last_m_end, last_m_start, create_col, pay_col, pipeline_col, track)
         with tabs[3]:
-            render_period_block(df_f, "This Month", this_m_start, this_m_end, this_m_start, create_col, pay_col, pipeline_col, track)
+            # >>> This Month = 1st .. TODAY (running MTD)
+            render_period_block(df_f, "This Month (MTD)", this_m_start, this_m_end_mtd, this_m_start, create_col, pay_col, pipeline_col, track)
         with tabs[4]:
             st.markdown("Select a **payments period** and choose the **Conversion% denominator** mode.")
             colc1, colc2 = st.columns(2)
@@ -930,7 +933,6 @@ def group_trend_analysis(
     pay_mask = d["_pay_dt"].between(pay_start, pay_end)
     create_mask = d["_create_dt"].between(create_start, create_end)
 
-    # Numerators
     num_mask = (pay_mask & create_mask) if level == "MTD" else pay_mask
     den_mask = create_mask
 
@@ -956,8 +958,7 @@ def group_trend_analysis(
 
 if view == "Trend & Analysis":
     st.subheader("Trend & Analysis – Grouped Drilldowns")
-
-    df_page = df_f.copy()  # reuse global filters only
+    df_page = df_f.copy()
 
     col1, col2, col3, col4 = st.columns([1.2, 1.2, 1.2, 1.0])
     with col1:
@@ -1085,13 +1086,6 @@ if view == "Predictibility":
             st.info("Not enough historical data to backtest with the chosen settings.")
         else:
             st.altair_chart(accuracy_scatter(bt), use_container_width=True)
-            with st.expander("Backtest details"):
-                show = bt.copy()
-                for c in ["Forecast","Actual","Error","AbsError","SqError"]:
-                    show[c] = show[c].round(2)
-                if show["APE"].notna().any():
-                    show["APE%"] = (show["APE"]*100).round(1)
-                st.dataframe(show.drop(columns=["APE"]), use_container_width=True)
 
 # Optional: data preview
 with st.expander("Data preview & column mapping", expanded=False):
