@@ -213,7 +213,7 @@ counsellor_col = find_col(df, ["Student/Academic Counsellor", "Academic Counsell
 country_col = find_col(df, ["Country"])
 source_col = find_col(df, ["JetLearn Deal Source", "Deal Source", "Source"])
 
-# NEW: exact event columns for Trend & Analysis
+# Event columns for Trend & Analysis
 first_cal_sched_col = find_col(df, ["First Calibration Scheduled Date", "First calibration scheduled date", "First_Calibration_Scheduled_Date"])
 cal_resched_col     = find_col(df, ["Calibration Rescheduled Date", "Calibration rescheduled date", "Calibration_Rescheduled_Date"])
 cal_done_col        = find_col(df, ["Calibration Done Date", "Calibration done date", "Calibration_Done_Date"])
@@ -910,99 +910,116 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Trend & Analysis — NEW (multi-group, MTD/Cohort, metric picker)
+# Trend & Analysis — CORRECTED (MTD population filter, Cohort event-month)
 # ----------------------------
-def count_events_table(
+def ta_count_table(
     df_scope: pd.DataFrame,
     group_cols: list[str],
-    mode: str,  # "MTD" or "Cohort"
-    event_start: date,
-    event_end: date,
-    create_start: date | None,
-    create_end: date | None,
+    mode: str,            # "MTD" or "Cohort"
+    month_pick: date,     # a date within the chosen month
     create_col: str,
-    metric_cols: dict,   # name -> column_name or None
+    metric_cols: dict,    # display_name -> column_name (or create_col for create metric)
     metrics_selected: list[str],
 ) -> pd.DataFrame:
     """
-    Returns a table grouped by group_cols with the requested metric counts.
-    mode:
-      - Cohort: counts by event date within [event_start, event_end], ignoring create date.
-      - MTD   : counts by event date within [event_start, event_end] AND create date within [create_start, create_end],
-                except 'Create Date (deals) — Count' which uses only the create window.
+    MTD:
+      - Filter rows to Create Date in selected month.
+      - For each event metric: count non-null event value (no event-date filter).
+      - Create Date (deals) — Count = number of rows in this population.
+    Cohort:
+      - No create-date restriction.
+      - For each event metric: count rows with event date in selected month.
+      - Create Date (deals) — Count = rows with Create Date in selected month.
     """
     if not group_cols:
-        # If no grouping chosen, synthesize a single group
         df_work = df_scope.copy()
         df_work["_GroupDummy"] = "All"
         group_cols = ["_GroupDummy"]
     else:
         df_work = df_scope.copy()
 
-    # Pre-coerce dates once
+    m_start, m_end = month_bounds(month_pick)
+
+    # Precompute create date & period
     df_work["_create_dt"] = coerce_datetime(df_work[create_col]).dt.date
 
-    # Build masks
-    create_mask = None
     if mode == "MTD":
-        # guard if None: use full span (but UI ensures not None)
-        c_start = create_start or event_start
-        c_end   = create_end or event_end
-        create_mask = df_work["_create_dt"].between(c_start, c_end)
+        # Population = deals created in the selected month
+        pop_mask = df_work["_create_dt"].between(m_start, m_end)
+        pop = df_work.loc[pop_mask].copy()
+    else:
+        pop = df_work.copy()
 
-    # For each selected metric, compute count given its column
-    out_frames = []
-    for m in metrics_selected:
-        col_name = metric_cols.get(m)
-        if m == "Create Date (deals) — Count":
-            if mode == "Cohort":
-                # Skip entirely in Cohort to avoid confusion
-                continue
-            # Count of deals created in create window
-            mask = create_mask
-            series = pd.Series([True] * len(df_work)) if mask is None else mask
-        else:
-            # Event-based metric
-            if not col_name or col_name not in df_work.columns:
-                # Missing column → produce zeros
-                series = pd.Series([False] * len(df_work))
+    # Build per-metric aggregates
+    outs = []
+    for disp in metrics_selected:
+        col = metric_cols.get(disp)
+
+        if disp == "Create Date (deals) — Count":
+            if mode == "MTD":
+                # Count of deals created in month (population size)
+                gdf = pop[group_cols].copy()
             else:
-                dt = coerce_datetime(df_work[col_name]).dt.date
-                event_mask = dt.between(event_start, event_end)
-                if mode == "MTD":
-                    series = event_mask & create_mask
-                else:
-                    series = event_mask
+                # Cohort: number of deals created in the selected month
+                mask = df_work["_create_dt"].between(m_start, m_end)
+                gdf = df_work.loc[mask, group_cols].copy()
 
-        g = df_work.loc[series, group_cols].copy()
-        if g.empty:
-            agg = pd.DataFrame(columns=group_cols + [m])
+            if gdf.empty:
+                agg = pd.DataFrame(columns=group_cols + [disp])
+            else:
+                agg = gdf.assign(_one=1).groupby(group_cols)["_one"].sum().reset_index().rename(columns={"_one": disp})
+            outs.append(agg)
+            continue
+
+        # Event metrics
+        if not col or col not in df_work.columns:
+            # Missing column → zeros
+            if pop.empty:
+                agg = pd.DataFrame(columns=group_cols + [disp])
+            else:
+                agg = pop[group_cols].assign(**{disp: 0}).groupby(group_cols)[disp].sum().reset_index()
+            outs.append(agg)
+            continue
+
+        # Coerce event date
+        ev = coerce_datetime(df_work[col]).dt.date
+
+        if mode == "MTD":
+            # From population created in month, count non-null events (any time)
+            mask_nonnull = df_work[col].notna()
+            gdf = pop.loc[mask_nonnull.loc[pop.index], group_cols].copy()
         else:
-            agg = g.assign(_one=1).groupby(group_cols)["_one"].sum().reset_index().rename(columns={"_one": m})
-        out_frames.append(agg)
+            # Cohort: count events whose date lies in the chosen month, regardless of create date
+            mask_evt_month = ev.between(m_start, m_end)
+            gdf = df_work.loc[mask_evt_month, group_cols].copy()
 
-    # Merge all selected metrics onto a common group frame
-    if out_frames:
-        result = out_frames[0]
-        for f in out_frames[1:]:
+        if gdf.empty:
+            agg = pd.DataFrame(columns=group_cols + [disp])
+        else:
+            agg = gdf.assign(_one=1).groupby(group_cols)["_one"].sum().reset_index().rename(columns={"_one": disp})
+        outs.append(agg)
+
+    # Merge all metric frames
+    if outs:
+        result = outs[0]
+        for f in outs[1:]:
             result = result.merge(f, on=group_cols, how="outer")
     else:
         result = pd.DataFrame(columns=group_cols)
 
     # Fill zeros for missing counts
-    metric_cols_list = [m for m in metrics_selected if not (m == "Create Date (deals) — Count" and mode == "Cohort")]
-    for m in metric_cols_list:
+    for m in metrics_selected:
         if m not in result.columns:
             result[m] = 0
-    result[metric_cols_list] = result[metric_cols_list].fillna(0).astype(int)
+    result[metrics_selected] = result[metrics_selected].fillna(0).astype(int)
 
-    # Sort nicely
-    if metric_cols_list:
-        result = result.sort_values(metric_cols_list, ascending=[False] + [False]*(len(metric_cols_list)-1))
+    # Sort by first metric (desc) for readability
+    if metrics_selected:
+        result = result.sort_values(metrics_selected[0], ascending=False)
     return result.reset_index(drop=True)
 
 if view == "Trend & Analysis":
-    st.subheader("Trend & Analysis – Grouped Drilldowns (Simple)")
+    st.subheader("Trend & Analysis – Grouped Drilldowns (Corrected)")
 
     # Group-by fields (multi)
     available_groups = []
@@ -1017,22 +1034,8 @@ if view == "Trend & Analysis":
     # Mode toggle
     level = st.radio("Mode", ["MTD", "Cohort"], index=0, horizontal=True)
 
-    # Event window (always shown) – default = this month 1 → today
-    colA, colB = st.columns(2)
-    with colA: event_start = st.date_input("Payments/Event window start", value=this_m_start, key="ta_evt_start")
-    with colB: event_end   = st.date_input("Payments/Event window end (inclusive)", value=this_m_end_mtd, key="ta_evt_end")
-
-    # Create window (only for MTD)
-    create_start = create_end = None
-    if level == "MTD":
-        colC, colD = st.columns(2)
-        with colC: create_start = st.date_input("Create Date start (deals created from)", value=this_m_start, key="ta_cr_start")
-        with colD: create_end   = st.date_input("Create Date end (deals created to)", value=this_m_end_mtd,   key="ta_cr_end")
-        if create_end < create_start:
-            st.error("Create Date end cannot be before start.")
-
-    if event_end < event_start:
-        st.error("Payments/Event window end cannot be before start.")
+    # Month picker (single month) — one control, interpretation differs by mode
+    month_pick = st.date_input("Select month (any date within the month)", value=today)
 
     # Metric picker
     all_metrics = [
@@ -1040,11 +1043,8 @@ if view == "Trend & Analysis":
         "First Calibration Scheduled Date — Count",
         "Calibration Rescheduled Date — Count",
         "Calibration Done Date — Count",
+        "Create Date (deals) — Count",
     ]
-    # Create count shown only in MTD
-    if level == "MTD":
-        all_metrics.append("Create Date (deals) — Count")
-
     metrics_selected = st.multiselect("Metrics to show", options=all_metrics, default=all_metrics)
 
     # Map metric display names to actual columns
@@ -1062,31 +1062,27 @@ if view == "Trend & Analysis":
         st.warning("Missing columns for: " + ", ".join(miss) + ". Those counts will show as 0.", icon="⚠️")
 
     # Build table
-    if (event_end >= event_start) and (level == "Cohort" or (create_end and create_start and create_end >= create_start)):
-        tbl = count_events_table(
-            df_scope=df_f,
-            group_cols=group_cols,
-            mode=level,
-            event_start=event_start,
-            event_end=event_end,
-            create_start=create_start,
-            create_end=create_end,
-            create_col=create_col,
-            metric_cols=metric_cols,
-            metrics_selected=metrics_selected,
-        )
+    tbl = ta_count_table(
+        df_scope=df_f,
+        group_cols=group_cols,
+        mode=level,
+        month_pick=month_pick,
+        create_col=create_col,
+        metric_cols=metric_cols,
+        metrics_selected=metrics_selected,
+    )
 
-        st.markdown("### Output")
-        if tbl.empty:
-            st.info("No rows match the selected filters and date ranges.")
-        else:
-            # Rename group columns back to friendly labels
-            rename_map = {group_map.get(lbl): lbl for lbl in sel_group_labels}
-            show = tbl.rename(columns=rename_map)
-            st.dataframe(show, use_container_width=True)
+    st.markdown("### Output")
+    if tbl.empty:
+        st.info("No rows match the selected filters and month.")
+    else:
+        # Rename group columns back to friendly labels
+        rename_map = {group_map.get(lbl): lbl for lbl in sel_group_labels}
+        show = tbl.rename(columns=rename_map)
+        st.dataframe(show, use_container_width=True)
 
-            csv = show.to_csv(index=False).encode("utf-8")
-            st.download_button("Download CSV (Trend & Analysis)", data=csv, file_name="trend_analysis_simple.csv", mime="text/csv")
+        csv = show.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV (Trend & Analysis)", data=csv, file_name="trend_analysis_corrected.csv", mime="text/csv")
 
 # ----------------------------
 # Predictibility (view)
