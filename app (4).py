@@ -171,7 +171,7 @@ with st.sidebar:
     st.header("JetLearn • Navigation")
     view = st.radio("Go to", ["MIS", "Predictibility", "Trend & Analysis"], index=0)
     track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)
-    st.caption("Use MIS for status (MTD up to today); Predictibility for forecast; Trend & Analysis for grouped drilldowns.")
+    st.caption("Use MIS for status; Predictibility for forecast; Trend & Analysis for grouped drilldowns.")
 
 st.title("📊 JetLearn MIS")
 
@@ -213,10 +213,16 @@ counsellor_col = find_col(df, ["Student/Academic Counsellor", "Academic Counsell
 country_col = find_col(df, ["Country"])
 source_col = find_col(df, ["JetLearn Deal Source", "Deal Source", "Source"])
 
+# NEW: exact event columns for Trend & Analysis
+first_cal_sched_col = find_col(df, ["First Calibration Scheduled Date", "First calibration scheduled date", "First_Calibration_Scheduled_Date"])
+cal_resched_col     = find_col(df, ["Calibration Rescheduled Date", "Calibration rescheduled date", "Calibration_Rescheduled_Date"])
+cal_done_col        = find_col(df, ["Calibration Done Date", "Calibration done date", "Calibration_Done_Date"])
+
 if not create_col or not pay_col:
     st.error("Could not find required date columns. Need 'Create Date' and 'Payment Received Date' (or close variants).")
     st.stop()
 
+# Drop rows with missing/invalid Create Date (main pipeline uses it widely)
 tmp_create_all = coerce_datetime(df[create_col])
 missing_create = int(tmp_create_all.isna().sum())
 if missing_create > 0:
@@ -227,8 +233,8 @@ if missing_create > 0:
 today = date.today()
 yday = today - timedelta(days=1)
 last_m_start, last_m_end = last_month_bounds(today)
-this_m_start, this_m_end = month_bounds(today)   # full month range
-this_m_end_mtd = today                            # MIS uses running MTD end
+this_m_start, this_m_end = month_bounds(today)     # full month
+this_m_end_mtd = today                              # MTD uses 1st -> today
 
 # ----------------------------
 # Filters expander (collapsed) + data path bottom-left
@@ -291,7 +297,7 @@ st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
 st.caption(f"Track filter: **{track}**")
 
 # ----------------------------
-# COUNT & CONVERSION LOGIC
+# COUNT & CONVERSION LOGIC (MIS & Predictibility reuse)
 # ----------------------------
 def prepare_counts_for_range(
     df: pd.DataFrame,
@@ -376,36 +382,28 @@ def prepare_conversion_for_range(
     else:
         pl = pd.Series(["Other"] * len(d), index=d.index)
 
-    den_total = int(denom_mask.sum())
-    den_ai    = int((denom_mask & (pl == "AI Coding")).sum())
-    den_math  = int((denom_mask & (pl == "Math")).sum())
+    den_total = int(denom_mask.sum()); den_ai = int((denom_mask & (pl == "AI Coding")).sum()); den_math = int((denom_mask & (pl == "Math")).sum())
     denoms = {"Total": den_total, "AI Coding": den_ai, "Math": den_math}
 
     pay_mask = d["_pay_dt"].between(start_d, end_d)
 
     mtd_mask = pay_mask & denom_mask
-    mtd_total = int(mtd_mask.sum())
-    mtd_ai    = int((mtd_mask & (pl == "AI Coding")).sum())
-    mtd_math  = int((mtd_mask & (pl == "Math")).sum())
+    mtd_total = int(mtd_mask.sum()); mtd_ai = int((mtd_mask & (pl == "AI Coding")).sum()); mtd_math = int((mtd_mask & (pl == "Math")).sum())
 
     coh_mask = pay_mask
-    coh_total = int(coh_mask.sum())
-    coh_ai    = int((coh_mask & (pl == "AI Coding")).sum())
-    coh_math  = int((coh_mask & (pl == "Math")).sum())
+    coh_total = int(coh_mask.sum()); coh_ai = int((coh_mask & (pl == "AI Coding")).sum()); coh_math = int((coh_mask & (pl == "Math")).sum())
 
     def pct(n, d):
-        if d == 0:
-            return 0.0
+        if d == 0: return 0.0
         return max(0.0, min(100.0, round(100.0 * n / d, 1)))
 
     mtd_pct = {"Total": pct(mtd_total, den_total), "AI Coding": pct(mtd_ai, den_ai), "Math": pct(mtd_math, den_math)}
     coh_pct = {"Total": pct(coh_total, den_total), "AI Coding": pct(coh_ai, den_ai), "Math": pct(coh_math, den_math)}
-    numerators = {"mtd": {"Total": mtd_total, "AI Coding": mtd_ai, "Math": mtd_math},
-                  "cohort": {"Total": coh_total, "AI Coding": coh_ai, "Math": coh_math}}
+    numerators = {"mtd": {"Total": mtd_total, "AI Coding": mtd_ai, "Math": mtd_math}, "cohort": {"Total": coh_total, "AI Coding": coh_ai, "Math": coh_math}}
     return mtd_pct, coh_pct, denoms, numerators
 
 # ----------------------------
-# Visuals
+# Visuals (MIS & Predictibility)
 # ----------------------------
 def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int, labels: list[str] = None):
     all_rows = [
@@ -433,8 +431,7 @@ def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int, labe
     text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text=alt.Text("Value:Q"))
     return (circles + text).properties(height=360, title=title)
 
-def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, denominator: int,
-                 thresholds=(10, 20)):
+def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, denominator: int, thresholds=(10, 20)):
     p = float(max(0.0, min(100.0, percent)))
     low, mid = thresholds
     bg = pd.DataFrame([
@@ -688,9 +685,7 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
             "Rate_Prev_Daily": rate_prev,
             "Remaining_Days": remaining_days
         })
-        A_tot += a_val
-        B_tot += b_val
-        C_tot += c_val
+        A_tot += a_val; B_tot += b_val; C_tot += c_val
 
     tbl = pd.DataFrame(rows).sort_values("Source").reset_index(drop=True)
     totals = {
@@ -863,7 +858,6 @@ if view == "MIS":
         with colB:
             render_period_block(df_f, "Today", today, today, today, create_col, pay_col, pipeline_col, track)
             st.divider()
-            # This Month = 1st .. TODAY (running MTD)
             render_period_block(df_f, "This Month (MTD)", this_m_start, this_m_end_mtd, this_m_start, create_col, pay_col, pipeline_col, track)
     else:
         tabs = st.tabs(["Yesterday", "Today", "Last Month", "This Month (MTD)", "Custom"])
@@ -874,7 +868,6 @@ if view == "MIS":
         with tabs[2]:
             render_period_block(df_f, "Last Month", last_m_start, last_m_end, last_m_start, create_col, pay_col, pipeline_col, track)
         with tabs[3]:
-            # This Month = 1st .. TODAY (running MTD)
             render_period_block(df_f, "This Month (MTD)", this_m_start, this_m_end_mtd, this_m_start, create_col, pay_col, pipeline_col, track)
         with tabs[4]:
             st.markdown("Select a **payments period** and choose the **Conversion% denominator** mode.")
@@ -917,197 +910,183 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Trend & Analysis (with Cohort full-history lock)
+# Trend & Analysis — NEW (multi-group, MTD/Cohort, metric picker)
 # ----------------------------
-def group_trend_analysis(
+def count_events_table(
     df_scope: pd.DataFrame,
-    group_col: str,
-    level: str,
-    pay_start: date,
-    pay_end: date,
-    create_start: date,
-    create_end: date,
+    group_cols: list[str],
+    mode: str,  # "MTD" or "Cohort"
+    event_start: date,
+    event_end: date,
+    create_start: date | None,
+    create_end: date | None,
     create_col: str,
-    pay_col: str,
+    metric_cols: dict,   # name -> column_name or None
+    metrics_selected: list[str],
 ) -> pd.DataFrame:
-    """Return table with Count_Payments, Count_Created, Conversion% per group."""
-    d = df_scope.copy()
-    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
-    d["_pay_dt"]    = coerce_datetime(d[pay_col]).dt.date
+    """
+    Returns a table grouped by group_cols with the requested metric counts.
+    mode:
+      - Cohort: counts by event date within [event_start, event_end], ignoring create date.
+      - MTD   : counts by event date within [event_start, event_end] AND create date within [create_start, create_end],
+                except 'Create Date (deals) — Count' which uses only the create window.
+    """
+    if not group_cols:
+        # If no grouping chosen, synthesize a single group
+        df_work = df_scope.copy()
+        df_work["_GroupDummy"] = "All"
+        group_cols = ["_GroupDummy"]
+    else:
+        df_work = df_scope.copy()
 
-    pay_mask = d["_pay_dt"].between(pay_start, pay_end)
-    create_mask = d["_create_dt"].between(create_start, create_end)
+    # Pre-coerce dates once
+    df_work["_create_dt"] = coerce_datetime(df_work[create_col]).dt.date
 
-    num_mask = (pay_mask & create_mask) if level == "MTD" else pay_mask
-    den_mask = create_mask
+    # Build masks
+    create_mask = None
+    if mode == "MTD":
+        # guard if None: use full span (but UI ensures not None)
+        c_start = create_start or event_start
+        c_end   = create_end or event_end
+        create_mask = df_work["_create_dt"].between(c_start, c_end)
 
-    g_vals = d[group_col].astype(str).fillna("Unknown")
-    payments_by_group = g_vals[num_mask].value_counts().rename("Count_Payments")
-    created_by_group  = g_vals[den_mask].value_counts().rename("Count_Created")
+    # For each selected metric, compute count given its column
+    out_frames = []
+    for m in metrics_selected:
+        col_name = metric_cols.get(m)
+        if m == "Create Date (deals) — Count":
+            if mode == "Cohort":
+                # Skip entirely in Cohort to avoid confusion
+                continue
+            # Count of deals created in create window
+            mask = create_mask
+            series = pd.Series([True] * len(df_work)) if mask is None else mask
+        else:
+            # Event-based metric
+            if not col_name or col_name not in df_work.columns:
+                # Missing column → produce zeros
+                series = pd.Series([False] * len(df_work))
+            else:
+                dt = coerce_datetime(df_work[col_name]).dt.date
+                event_mask = dt.between(event_start, event_end)
+                if mode == "MTD":
+                    series = event_mask & create_mask
+                else:
+                    series = event_mask
 
-    all_groups = sorted(set(payments_by_group.index) | set(created_by_group.index))
-    result = pd.DataFrame({"Group": all_groups}).set_index("Group")
+        g = df_work.loc[series, group_cols].copy()
+        if g.empty:
+            agg = pd.DataFrame(columns=group_cols + [m])
+        else:
+            agg = g.assign(_one=1).groupby(group_cols)["_one"].sum().reset_index().rename(columns={"_one": m})
+        out_frames.append(agg)
 
-    result = result.join(payments_by_group, how="left").join(created_by_group, how="left").fillna(0.0)
-    result["Count_Payments"] = result["Count_Payments"].astype(int)
-    result["Count_Created"]  = result["Count_Created"].astype(int)
+    # Merge all selected metrics onto a common group frame
+    if out_frames:
+        result = out_frames[0]
+        for f in out_frames[1:]:
+            result = result.merge(f, on=group_cols, how="outer")
+    else:
+        result = pd.DataFrame(columns=group_cols)
 
-    def pct(n, d):
-        if d <= 0:
-            return 0.0
-        return round(100.0 * n / d, 1)
+    # Fill zeros for missing counts
+    metric_cols_list = [m for m in metrics_selected if not (m == "Create Date (deals) — Count" and mode == "Cohort")]
+    for m in metric_cols_list:
+        if m not in result.columns:
+            result[m] = 0
+    result[metric_cols_list] = result[metric_cols_list].fillna(0).astype(int)
 
-    result["Conversion%"] = [pct(result.loc[g, "Count_Payments"], result.loc[g, "Count_Created"]) for g in result.index]
-    result = result.reset_index()
-    return result.sort_values(["Count_Payments", "Count_Created"], ascending=[False, False])
+    # Sort nicely
+    if metric_cols_list:
+        result = result.sort_values(metric_cols_list, ascending=[False] + [False]*(len(metric_cols_list)-1))
+    return result.reset_index(drop=True)
 
 if view == "Trend & Analysis":
-    st.subheader("Trend & Analysis – Grouped Drilldowns")
-    df_page = df_f.copy()
+    st.subheader("Trend & Analysis – Grouped Drilldowns (Simple)")
 
-    # Precompute min/max create dates from filtered data to drive Cohort defaults
-    if not df_page.empty:
-        _create_series = coerce_datetime(df_page[create_col]).dropna()
-        if _create_series.empty:
-            hist_min_date = this_m_start
-            hist_max_date = this_m_end
-        else:
-            hist_min_date = _create_series.min().date()
-            hist_max_date = _create_series.max().date()
-    else:
-        hist_min_date, hist_max_date = this_m_start, this_m_end
+    # Group-by fields (multi)
+    available_groups = []
+    group_map = {}
+    if counsellor_col: available_groups.append("Academic Counsellor"); group_map["Academic Counsellor"] = counsellor_col
+    if country_col:    available_groups.append("Country");            group_map["Country"] = country_col
+    if source_col:     available_groups.append("JetLearn Deal Source"); group_map["JetLearn Deal Source"] = source_col
 
-    col1, col2, col3, col4 = st.columns([1.2, 1.2, 1.2, 1.0])
-    with col1:
-        group_by_label = st.selectbox("Group by", ["Academic Counsellor", "Country", "Deal Source"], index=0)
-    with col2:
-        level = st.radio("Level", ["MTD", "Cohort"], index=0, horizontal=True)
-    with col3:
-        pay_start = st.date_input("Payments period start", value=this_m_start, key="ta_pay_start")
-    with col4:
-        pay_end   = st.date_input("Payments period end (inclusive)", value=this_m_end, key="ta_pay_end")
+    sel_group_labels = st.multiselect("Group by (pick one or more)", options=available_groups, default=available_groups[:1] if available_groups else [])
+    group_cols = [group_map[l] for l in sel_group_labels if l in group_map]
 
-    # --- Cohort full-history lock (no manual pre-setting of this key!) ---
-    lock_default = st.session_state.get("ta_lock_full_history", True)
+    # Mode toggle
+    level = st.radio("Mode", ["MTD", "Cohort"], index=0, horizontal=True)
 
-    # Session keys to persist date selections
-    if "ta_create_start_cohort" not in st.session_state:
-        st.session_state["ta_create_start_cohort"] = hist_min_date
-    if "ta_create_end_cohort" not in st.session_state:
-        st.session_state["ta_create_end_cohort"] = hist_max_date
-    if "ta_create_start_mtd" not in st.session_state:
-        st.session_state["ta_create_start_mtd"] = this_m_start
-    if "ta_create_end_mtd" not in st.session_state:
-        st.session_state["ta_create_end_mtd"] = this_m_end
+    # Event window (always shown) – default = this month 1 → today
+    colA, colB = st.columns(2)
+    with colA: event_start = st.date_input("Payments/Event window start", value=this_m_start, key="ta_evt_start")
+    with colB: event_end   = st.date_input("Payments/Event window end (inclusive)", value=this_m_end_mtd, key="ta_evt_end")
 
-    # If Level toggles to Cohort and lock currently True, align to full history (without writing the lock key here)
-    if level == "Cohort" and lock_default:
-        st.session_state["ta_create_start_cohort"] = hist_min_date
-        st.session_state["ta_create_end_cohort"] = hist_max_date
+    # Create window (only for MTD)
+    create_start = create_end = None
+    if level == "MTD":
+        colC, colD = st.columns(2)
+        with colC: create_start = st.date_input("Create Date start (deals created from)", value=this_m_start, key="ta_cr_start")
+        with colD: create_end   = st.date_input("Create Date end (deals created to)", value=this_m_end_mtd,   key="ta_cr_end")
+        if create_end < create_start:
+            st.error("Create Date end cannot be before start.")
 
-    # UI for create-date period
-    col5, col6 = st.columns(2)
-    if level == "Cohort":
-        lock = st.checkbox(
-            "Lock create-date to full history (Cohort)",
-            key="ta_lock_full_history",
-            value=lock_default,
+    if event_end < event_start:
+        st.error("Payments/Event window end cannot be before start.")
+
+    # Metric picker
+    all_metrics = [
+        "Payment Received Date — Count",
+        "First Calibration Scheduled Date — Count",
+        "Calibration Rescheduled Date — Count",
+        "Calibration Done Date — Count",
+    ]
+    # Create count shown only in MTD
+    if level == "MTD":
+        all_metrics.append("Create Date (deals) — Count")
+
+    metrics_selected = st.multiselect("Metrics to show", options=all_metrics, default=all_metrics)
+
+    # Map metric display names to actual columns
+    metric_cols = {
+        "Payment Received Date — Count": pay_col,
+        "First Calibration Scheduled Date — Count": first_cal_sched_col,
+        "Calibration Rescheduled Date — Count": cal_resched_col,
+        "Calibration Done Date — Count": cal_done_col,
+        "Create Date (deals) — Count": create_col,
+    }
+
+    # Warnings for missing columns (only for metrics the user selected)
+    miss = [m for m in metrics_selected if (m != "Create Date (deals) — Count" and (metric_cols.get(m) is None or metric_cols.get(m) not in df_f.columns))]
+    if miss:
+        st.warning("Missing columns for: " + ", ".join(miss) + ". Those counts will show as 0.", icon="⚠️")
+
+    # Build table
+    if (event_end >= event_start) and (level == "Cohort" or (create_end and create_start and create_end >= create_start)):
+        tbl = count_events_table(
+            df_scope=df_f,
+            group_cols=group_cols,
+            mode=level,
+            event_start=event_start,
+            event_end=event_end,
+            create_start=create_start,
+            create_end=create_end,
+            create_col=create_col,
+            metric_cols=metric_cols,
+            metrics_selected=metrics_selected,
         )
-        with col5:
-            create_start = st.date_input(
-                "Create-date period start",
-                value=st.session_state["ta_create_start_cohort"],
-                key="ta_create_start_cohort_input",
-                disabled=st.session_state.get("ta_lock_full_history", True),
-            )
-        with col6:
-            create_end = st.date_input(
-                "Create-date period end (inclusive)",
-                value=st.session_state["ta_create_end_cohort"],
-                key="ta_create_end_cohort_input",
-                disabled=st.session_state.get("ta_lock_full_history", True),
-            )
 
-        # When locked, force full history (local variables only)
-        if st.session_state.get("ta_lock_full_history", True):
-            create_start = hist_min_date
-            create_end = hist_max_date
+        st.markdown("### Output")
+        if tbl.empty:
+            st.info("No rows match the selected filters and date ranges.")
         else:
-            # Persist unlocked edits
-            st.session_state["ta_create_start_cohort"] = create_start
-            st.session_state["ta_create_end_cohort"] = create_end
+            # Rename group columns back to friendly labels
+            rename_map = {group_map.get(lbl): lbl for lbl in sel_group_labels}
+            show = tbl.rename(columns=rename_map)
+            st.dataframe(show, use_container_width=True)
 
-        # Reset button safely updates widget keys then reruns
-        if st.button("Reset to full history"):
-            st.session_state["ta_create_start_cohort"] = hist_min_date
-            st.session_state["ta_create_end_cohort"] = hist_max_date
-            st.session_state["ta_lock_full_history"] = True
-            st.rerun()
-
-        st.markdown(f"<span class='chip'>Create-date range in use: {create_start} → {create_end}</span>", unsafe_allow_html=True)
-
-    else:
-        with col5:
-            create_start = st.date_input(
-                "Create-date period start",
-                value=st.session_state["ta_create_start_mtd"],
-                key="ta_create_start_mtd_input",
-            )
-        with col6:
-            create_end   = st.date_input(
-                "Create-date period end (inclusive)",
-                value=st.session_state["ta_create_end_mtd"],
-                key="ta_create_end_mtd_input",
-            )
-        st.session_state["ta_create_start_mtd"] = create_start
-        st.session_state["ta_create_end_mtd"] = create_end
-        st.markdown(f"<span class='chip'>Create-date range in use: {create_start} → {create_end}</span>", unsafe_allow_html=True)
-
-    if pay_end < pay_start:
-        st.error("Payments period end cannot be before start.")
-    elif create_end < create_start:
-        st.error("Create-date period end cannot be before start.")
-    else:
-        group_col_map = {
-            "Academic Counsellor": counsellor_col,
-            "Country": country_col,
-            "Deal Source": source_col,
-        }
-        group_col = group_col_map[group_by_label]
-
-        if not group_col:
-            st.warning(f"Column for '{group_by_label}' not found in your data.")
-        else:
-            tbl = group_trend_analysis(df_page, group_col, level, pay_start, pay_end, create_start, create_end, create_col, pay_col)
-
-            st.markdown("### Output")
-            if tbl.empty:
-                st.info("No rows match the selected filters and date ranges.")
-            else:
-                show = tbl.copy()
-                show["Conversion%"] = show["Conversion%"].map(lambda x: f"{x:.1f}%")
-                st.dataframe(show.rename(columns={"Group": group_by_label}), use_container_width=True)
-
-                st.markdown("#### Quick charts")
-                c1, c2 = st.columns(2)
-                with c1:
-                    top_pay = tbl.nlargest(15, "Count_Payments")
-                    chart1 = alt.Chart(top_pay).mark_bar().encode(
-                        x=alt.X("Count_Payments:Q", title="Count of Payment Received Date"),
-                        y=alt.Y("Group:N", sort="-x", title=group_by_label),
-                        tooltip=[alt.Tooltip("Group:N"), alt.Tooltip("Count_Payments:Q")]
-                    ).properties(height=360, title="Top groups by Payments")
-                    st.altair_chart(chart1, use_container_width=True)
-                with c2:
-                    chart2 = alt.Chart(tbl).mark_bar().encode(
-                        x=alt.X("Conversion%:Q", title="Conversion %"),
-                        y=alt.Y("Group:N", sort="-x", title=group_by_label),
-                        tooltip=[alt.Tooltip("Group:N"), alt.Tooltip("Conversion%:Q")]
-                    ).properties(height=360, title="Conversion% by group")
-                    st.altair_chart(chart2, use_container_width=True)
-
-                csv = tbl.to_csv(index=False).encode("utf-8")
-                st.download_button("Download CSV (Trend & Analysis)", data=csv, file_name="trend_analysis.csv", mime="text/csv")
+            csv = show.to_csv(index=False).encode("utf-8")
+            st.download_button("Download CSV (Trend & Analysis)", data=csv, file_name="trend_analysis_simple.csv", mime="text/csv")
 
 # ----------------------------
 # Predictibility (view)
@@ -1174,11 +1153,16 @@ if view == "Predictibility":
         else:
             st.altair_chart(accuracy_scatter(bt), use_container_width=True)
 
-# Optional: data preview
+# ----------------------------
+# Data preview
+# ----------------------------
 with st.expander("Data preview & column mapping", expanded=False):
     st.write({
         "Create Date": create_col,
         "Payment Received Date": pay_col,
+        "First Calibration Scheduled Date": first_cal_sched_col or "Not found",
+        "Calibration Rescheduled Date": cal_resched_col or "Not found",
+        "Calibration Done Date": cal_done_col or "Not found",
         "Pipeline (split)": pipeline_col or "Not found → using heuristic",
         "Academic Counsellor": counsellor_col or "Not found",
         "Country": country_col or "Not found",
