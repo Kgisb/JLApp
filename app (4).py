@@ -51,6 +51,11 @@ st.markdown(
         margin-top: .25rem;
         margin-bottom: .25rem;
       }
+      .chip {
+        display:inline-block; padding:4px 8px; border-radius:999px;
+        background:#f3f4f6; color:#374151; font-size:.8rem; margin-top:.25rem;
+      }
+      .muted { color:#6b7280; font-size:.85rem; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -155,7 +160,7 @@ def exclude_invalid_deals(df: pd.DataFrame, dealstage_col: str | None) -> tuple[
 # ----------------------------
 # Session state for data path (default)
 # ----------------------------
-DEFAULT_DATA_PATH = "Master_sheet-DB.csv"
+DEFAULT_DATA_PATH = "Master_sheet_DB.csv"
 if "data_src" not in st.session_state:
     st.session_state["data_src"] = DEFAULT_DATA_PATH
 
@@ -212,18 +217,18 @@ if not create_col or not pay_col:
     st.error("Could not find required date columns. Need 'Create Date' and 'Payment Received Date' (or close variants).")
     st.stop()
 
-tmp_create = coerce_datetime(df[create_col])
-missing_create = int(tmp_create.isna().sum())
+tmp_create_all = coerce_datetime(df[create_col])
+missing_create = int(tmp_create_all.isna().sum())
 if missing_create > 0:
-    df = df.loc[tmp_create.notna()].copy()
+    df = df.loc[tmp_create_all.notna()].copy()
     st.caption(f"Removed rows with missing/invalid **Create Date**: **{missing_create:,}**")
 
 # --- Period presets
 today = date.today()
 yday = today - timedelta(days=1)
 last_m_start, last_m_end = last_month_bounds(today)
-this_m_start, this_m_end = month_bounds(today)  # month bounds (1st .. last day)
-this_m_end_mtd = today                           # >>> MIS uses running MTD end (= today)
+this_m_start, this_m_end = month_bounds(today)   # full month range
+this_m_end_mtd = today                            # MIS uses running MTD end
 
 # ----------------------------
 # Filters expander (collapsed) + data path bottom-left
@@ -858,7 +863,7 @@ if view == "MIS":
         with colB:
             render_period_block(df_f, "Today", today, today, today, create_col, pay_col, pipeline_col, track)
             st.divider()
-            # >>> This Month = 1st .. TODAY (running MTD)
+            # This Month = 1st .. TODAY (running MTD)
             render_period_block(df_f, "This Month (MTD)", this_m_start, this_m_end_mtd, this_m_start, create_col, pay_col, pipeline_col, track)
     else:
         tabs = st.tabs(["Yesterday", "Today", "Last Month", "This Month (MTD)", "Custom"])
@@ -869,7 +874,7 @@ if view == "MIS":
         with tabs[2]:
             render_period_block(df_f, "Last Month", last_m_start, last_m_end, last_m_start, create_col, pay_col, pipeline_col, track)
         with tabs[3]:
-            # >>> This Month = 1st .. TODAY (running MTD)
+            # This Month = 1st .. TODAY (running MTD)
             render_period_block(df_f, "This Month (MTD)", this_m_start, this_m_end_mtd, this_m_start, create_col, pay_col, pipeline_col, track)
         with tabs[4]:
             st.markdown("Select a **payments period** and choose the **Conversion% denominator** mode.")
@@ -912,7 +917,7 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Trend & Analysis (reuses global Filters only)
+# Trend & Analysis (with Cohort full-history lock)
 # ----------------------------
 def group_trend_analysis(
     df_scope: pd.DataFrame,
@@ -933,6 +938,9 @@ def group_trend_analysis(
     pay_mask = d["_pay_dt"].between(pay_start, pay_end)
     create_mask = d["_create_dt"].between(create_start, create_end)
 
+    # Numerator:
+    #  - MTD: payments in pay-window AND created in create-window
+    #  - Cohort: payments in pay-window (denominator is create-window)
     num_mask = (pay_mask & create_mask) if level == "MTD" else pay_mask
     den_mask = create_mask
 
@@ -960,6 +968,18 @@ if view == "Trend & Analysis":
     st.subheader("Trend & Analysis – Grouped Drilldowns")
     df_page = df_f.copy()
 
+    # Precompute min/max create dates from filtered data to drive Cohort defaults
+    if not df_page.empty:
+        _create_series = coerce_datetime(df_page[create_col]).dropna()
+        if _create_series.empty:
+            hist_min_date = this_m_start
+            hist_max_date = this_m_end
+        else:
+            hist_min_date = _create_series.min().date()
+            hist_max_date = _create_series.max().date()
+    else:
+        hist_min_date, hist_max_date = this_m_start, this_m_end
+
     col1, col2, col3, col4 = st.columns([1.2, 1.2, 1.2, 1.0])
     with col1:
         group_by_label = st.selectbox("Group by", ["Academic Counsellor", "Country", "Deal Source"], index=0)
@@ -970,11 +990,80 @@ if view == "Trend & Analysis":
     with col4:
         pay_end   = st.date_input("Payments period end (inclusive)", value=this_m_end, key="ta_pay_end")
 
+    # --- Cohort full-history lock (checkbox + optional reset) ---
+    if "ta_lock_full_history" not in st.session_state:
+        st.session_state["ta_lock_full_history"] = True  # default locked
+
+    # Track create-date selections in session_state so reset/unlock works smoothly
+    # Different keys for cohort vs mtd
+    if "ta_create_start_cohort" not in st.session_state:
+        st.session_state["ta_create_start_cohort"] = hist_min_date
+    if "ta_create_end_cohort" not in st.session_state:
+        st.session_state["ta_create_end_cohort"] = hist_max_date
+    if "ta_create_start_mtd" not in st.session_state:
+        st.session_state["ta_create_start_mtd"] = this_m_start
+    if "ta_create_end_mtd" not in st.session_state:
+        st.session_state["ta_create_end_mtd"] = this_m_end
+
+    # If Level toggles to Cohort and lock is on, ensure session values reflect full history
+    if level == "Cohort" and st.session_state["ta_lock_full_history"]:
+        st.session_state["ta_create_start_cohort"] = hist_min_date
+        st.session_state["ta_create_end_cohort"] = hist_max_date
+
+    # UI for create-date period
     col5, col6 = st.columns(2)
-    with col5:
-        create_start = st.date_input("Create-date period start", value=this_m_start, key="ta_create_start")
-    with col6:
-        create_end   = st.date_input("Create-date period end (inclusive)", value=this_m_end, key="ta_create_end")
+    if level == "Cohort":
+        lock = st.checkbox("Lock create-date to full history (Cohort)", value=st.session_state["ta_lock_full_history"], key="ta_lock_full_history")
+        with col5:
+            create_start = st.date_input(
+                "Create-date period start",
+                value=st.session_state["ta_create_start_cohort"],
+                key="ta_create_start_cohort_input",
+                disabled=st.session_state["ta_lock_full_history"],
+            )
+        with col6:
+            create_end = st.date_input(
+                "Create-date period end (inclusive)",
+                value=st.session_state["ta_create_end_cohort"],
+                key="ta_create_end_cohort_input",
+                disabled=st.session_state["ta_lock_full_history"],
+            )
+
+        # When locked, force full history in variables
+        if st.session_state["ta_lock_full_history"]:
+            create_start = hist_min_date
+            create_end = hist_max_date
+
+        # Persist unlocked edits to session
+        else:
+            st.session_state["ta_create_start_cohort"] = create_start
+            st.session_state["ta_create_end_cohort"] = create_end
+
+        # Reset button (always visible)
+        if st.button("Reset to full history"):
+            st.session_state["ta_create_start_cohort"] = hist_min_date
+            st.session_state["ta_create_end_cohort"] = hist_max_date
+            st.session_state["ta_lock_full_history"] = True
+            st.rerun()
+
+        st.markdown(f"<span class='chip'>Create-date range in use: {create_start} → {create_end}</span>", unsafe_allow_html=True)
+
+    else:
+        with col5:
+            create_start = st.date_input(
+                "Create-date period start",
+                value=st.session_state["ta_create_start_mtd"],
+                key="ta_create_start_mtd_input",
+            )
+        with col6:
+            create_end   = st.date_input(
+                "Create-date period end (inclusive)",
+                value=st.session_state["ta_create_end_mtd"],
+                key="ta_create_end_mtd_input",
+            )
+        st.session_state["ta_create_start_mtd"] = create_start
+        st.session_state["ta_create_end_mtd"] = create_end
+        st.markdown(f"<span class='chip'>Create-date range in use: {create_start} → {create_end}</span>", unsafe_allow_html=True)
 
     if pay_end < pay_start:
         st.error("Payments period end cannot be before start.")
