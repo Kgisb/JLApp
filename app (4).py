@@ -902,18 +902,18 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Trend & Analysis — with derived "Future Calibration Scheduled — Count"
+# Trend & Analysis — FINAL RULES (MTD vs Cohort with date range)
 # ----------------------------
 def ta_count_table(
     df_scope: pd.DataFrame,
     group_cols: list[str],
-    mode: str,            # "MTD" or "Cohort"
-    month_pick: date,     # a date within the chosen month
+    mode: str,                 # "MTD" or "Cohort"
+    range_start: date,         # start of selected range
+    range_end: date,           # end of selected range (inclusive)
     create_col: str,
-    metric_cols: dict,    # display_name -> column_name (or None for derived)
+    metric_cols: dict,         # display_name -> column_name (or None for derived)
     metrics_selected: list[str],
     *,
-    cutoff_date: date,    # end of scope for "Future Calibration Scheduled"
     first_cal_col: str | None,
     cal_resched_col: str | None,
 ) -> pd.DataFrame:
@@ -925,10 +925,10 @@ def ta_count_table(
     else:
         df_work = df_scope.copy()
 
-    m_start, m_end = month_bounds(month_pick)
-    df_work["_create_dt"] = coerce_datetime(df_work[create_col]).dt.date
+    # Precompute create and event dates
+    create_dt = coerce_datetime(df_work[create_col]).dt.date
 
-    # Build effective calibration date (rescheduled takes precedence, else first)
+    # For calibration, build effective event = rescheduled if present else first
     if first_cal_col and first_cal_col in df_work.columns:
         first_dt = coerce_datetime(df_work[first_cal_col])
     else:
@@ -938,16 +938,11 @@ def ta_count_table(
     else:
         resch_dt = pd.Series(pd.NaT, index=df_work.index)
 
-    eff_cal = resch_dt.copy()
-    eff_cal = eff_cal.fillna(first_dt)
+    eff_cal = resch_dt.copy().fillna(first_dt)          # effective calibration datetime
     eff_cal_date = eff_cal.dt.date
 
-    # Population for MTD
-    if mode == "MTD":
-        pop_mask = df_work["_create_dt"].between(m_start, m_end)
-        pop = df_work.loc[pop_mask].copy()
-    else:
-        pop = df_work.copy()
+    # Population for MTD (deals created within range)
+    pop_mask_mtd = create_dt.between(range_start, range_end)
 
     outs = []
     for disp in metrics_selected:
@@ -956,42 +951,52 @@ def ta_count_table(
         # Create Date (deals) — Count
         if disp == "Create Date (deals) — Count":
             if mode == "MTD":
-                gdf = pop[group_cols].copy()
+                idx = pop_mask_mtd
             else:
-                mask = df_work["_create_dt"].between(m_start, m_end)
-                gdf = df_work.loc[mask, group_cols].copy()
+                idx = create_dt.between(range_start, range_end)
+            gdf = df_work.loc[idx, group_cols].copy()
             agg = gdf.assign(_one=1).groupby(group_cols)["_one"].sum().reset_index().rename(columns={"_one": disp}) if not gdf.empty else pd.DataFrame(columns=group_cols+[disp])
             outs.append(agg)
             continue
 
-        # Derived: Future Calibration Scheduled — Count
+        # Derived: Future Calibration Scheduled — Count (uses effective cal date)
         if disp == "Future Calibration Scheduled — Count":
-            mask_future = pd.Series(False, index=df_work.index)
-            if eff_cal_date is not None:
-                mask_future = eff_cal_date > cutoff_date
+            if eff_cal_date is None:
+                # No relevant columns -> zeros
+                target = df_work.loc[pop_mask_mtd if mode=="MTD" else slice(None), group_cols] if mode == "MTD" else df_work[group_cols]
+                agg = target.assign(**{disp:0}).groupby(group_cols)[disp].sum().reset_index() if not target.empty else pd.DataFrame(columns=group_cols+[disp])
+                outs.append(agg)
+                continue
+            ev_in_range = eff_cal_date.between(range_start, range_end)
             if mode == "MTD":
-                gdf = pop.loc[mask_future.loc[pop.index], group_cols].copy()
+                idx = pop_mask_mtd & ev_in_range
             else:
-                gdf = df_work.loc[mask_future, group_cols].copy()
+                idx = ev_in_range
+            gdf = df_work.loc[idx, group_cols].copy()
             agg = gdf.assign(_one=1).groupby(group_cols)["_one"].sum().reset_index().rename(columns={"_one": disp}) if not gdf.empty else pd.DataFrame(columns=group_cols+[disp])
             outs.append(agg)
             continue
 
-        # Other event metrics
+        # Other event metrics (Payment, First Cal, Rescheduled, Done)
         if (not col) or (col not in df_work.columns):
-            target = pop if mode == "MTD" else df_work
-            agg = target[group_cols].assign(**{disp:0}).groupby(group_cols)[disp].sum().reset_index() if not target.empty else pd.DataFrame(columns=group_cols+[disp])
+            # Missing column -> zeros over correct base
+            base_idx = pop_mask_mtd if mode == "MTD" else slice(None)
+            target = df_work.loc[base_idx, group_cols] if mode == "MTD" else df_work[group_cols]
+            agg = target.assign(**{disp:0}).groupby(group_cols)[disp].sum().reset_index() if not target.empty else pd.DataFrame(columns=group_cols+[disp])
             outs.append(agg)
             continue
 
-        ev = coerce_datetime(df_work[col]).dt.date
-        if mode == "MTD":
-            mask_nonnull = df_work[col].notna()
-            gdf = pop.loc[mask_nonnull.loc[pop.index], group_cols].copy()
-        else:
-            mask_evt_month = ev.between(m_start, m_end)
-            gdf = df_work.loc[mask_evt_month, group_cols].copy()
+        ev_date = coerce_datetime(df_work[col]).dt.date
+        ev_in_range = ev_date.between(range_start, range_end)
 
+        if mode == "MTD":
+            # Count only if: deal is in population (created in range) AND event date also in range
+            idx = pop_mask_mtd & ev_in_range
+        else:
+            # Cohort: event date in range, ignore create
+            idx = ev_in_range
+
+        gdf = df_work.loc[idx, group_cols].copy()
         agg = gdf.assign(_one=1).groupby(group_cols)["_one"].sum().reset_index().rename(columns={"_one": disp}) if not gdf.empty else pd.DataFrame(columns=group_cols+[disp])
         outs.append(agg)
 
@@ -1008,17 +1013,16 @@ def ta_count_table(
             result[m] = 0
     result[metrics_selected] = result[metrics_selected].fillna(0).astype(int)
 
-    # Sort by first metric if present
+    # Sort by first metric (if any) for readability
     if metrics_selected:
         result = result.sort_values(metrics_selected[0], ascending=False)
     return result.reset_index(drop=True)
 
 if view == "Trend & Analysis":
-    st.subheader("Trend & Analysis – Grouped Drilldowns (Corrected + Future Calibration)")
+    st.subheader("Trend & Analysis – Grouped Drilldowns (Final rules)")
 
     # Group-by fields
-    available_groups = []
-    group_map = {}
+    available_groups, group_map = [], {}
     if counsellor_col: available_groups.append("Academic Counsellor"); group_map["Academic Counsellor"] = counsellor_col
     if country_col:    available_groups.append("Country");            group_map["Country"] = country_col
     if source_col:     available_groups.append("JetLearn Deal Source"); group_map["JetLearn Deal Source"] = source_col
@@ -1026,63 +1030,44 @@ if view == "Trend & Analysis":
     sel_group_labels = st.multiselect("Group by (pick one or more)", options=available_groups, default=available_groups[:1] if available_groups else [])
     group_cols = [group_map[l] for l in sel_group_labels if l in group_map]
 
-    # Mode toggle
+    # Mode
     level = st.radio("Mode", ["MTD", "Cohort"], index=0, horizontal=True)
 
     # Date scope
-    date_mode = st.radio(
-        "Date scope",
-        ["This month", "Last month", "Custom date range"],
-        index=0,
-        horizontal=True
-    )
-
+    date_mode = st.radio("Date scope", ["This month", "Last month", "Custom date range"], index=0, horizontal=True)
     if date_mode == "This month":
-        month_pick = today
-        scope_start, scope_end = month_bounds(today)
-        cutoff_date = scope_end
-        st.caption(f"Using **this month**: {today.strftime('%b %Y')} (cutoff = {cutoff_date})")
+        range_start, range_end = month_bounds(today)
+        st.caption(f"Scope: **This month** ({range_start} → {range_end})")
     elif date_mode == "Last month":
-        lm_start, lm_end = last_month_bounds(today)
-        month_pick = lm_start
-        scope_start, scope_end = lm_start, lm_end
-        cutoff_date = scope_end
-        st.caption(f"Using **last month**: {lm_start.strftime('%b %Y')} (cutoff = {cutoff_date})")
+        range_start, range_end = last_month_bounds(today)
+        st.caption(f"Scope: **Last month** ({range_start} → {range_end})")
     else:
         col_d1, col_d2 = st.columns(2)
-        with col_d1:
-            custom_start = st.date_input("Start date", value=today.replace(day=1))
-        with col_d2:
-            _m_start, _m_end = month_bounds(custom_start)
-            custom_end = st.date_input("End date", value=_m_end)
-        if custom_end < custom_start:
-            st.error("End date cannot be before start date."); st.stop()
-        if (custom_start.year, custom_start.month) != (custom_end.year, custom_end.month):
-            st.error("Pick a custom range within a single calendar month."); st.stop()
-        month_pick = custom_start
-        scope_start, scope_end = custom_start, custom_end
-        cutoff_date = custom_end
-        st.caption(f"Using **custom month**: {custom_start.strftime('%b %Y')} (cutoff = {cutoff_date})")
+        with col_d1: range_start = st.date_input("Start date", value=today.replace(day=1))
+        with col_d2: range_end   = st.date_input("End date", value=month_bounds(today)[1])
+        if range_end < range_start:
+            st.error("End date cannot be before start date.")
+            st.stop()
+        st.caption(f"Scope: **Custom** ({range_start} → {range_end})")
 
-    # Metric picker (added derived metric)
+    # Metric picker (includes derived)
     all_metrics = [
         "Payment Received Date — Count",
         "First Calibration Scheduled Date — Count",
         "Calibration Rescheduled Date — Count",
         "Calibration Done Date — Count",
         "Create Date (deals) — Count",
-        "Future Calibration Scheduled — Count",   # NEW
+        "Future Calibration Scheduled — Count",
     ]
     metrics_selected = st.multiselect("Metrics to show", options=all_metrics, default=all_metrics)
 
-    # Map metric display names to columns
     metric_cols = {
         "Payment Received Date — Count": pay_col,
         "First Calibration Scheduled Date — Count": first_cal_sched_col,
         "Calibration Rescheduled Date — Count": cal_resched_col,
         "Calibration Done Date — Count": cal_done_col,
         "Create Date (deals) — Count": create_col,
-        "Future Calibration Scheduled — Count": None,  # handled in function
+        "Future Calibration Scheduled — Count": None,  # derived
     }
 
     # Missing column warnings
@@ -1103,25 +1088,25 @@ if view == "Trend & Analysis":
         df_scope=df_f,
         group_cols=group_cols,
         mode=level,
-        month_pick=month_pick,
+        range_start=range_start,
+        range_end=range_end,
         create_col=create_col,
         metric_cols=metric_cols,
         metrics_selected=metrics_selected,
-        cutoff_date=scope_end,
         first_cal_col=first_cal_sched_col,
         cal_resched_col=cal_resched_col,
     )
 
     st.markdown("### Output")
     if tbl.empty:
-        st.info("No rows match the selected filters and month.")
+        st.info("No rows match the selected filters and date range.")
     else:
         rename_map = {group_map.get(lbl): lbl for lbl in sel_group_labels}
         show = tbl.rename(columns=rename_map)
         st.dataframe(show, use_container_width=True)
 
         csv = show.to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV (Trend & Analysis)", data=csv, file_name="trend_analysis_corrected.csv", mime="text/csv")
+        st.download_button("Download CSV (Trend & Analysis)", data=csv, file_name="trend_analysis_final.csv", mime="text/csv")
 
 # ----------------------------
 # Predictibility (view)
