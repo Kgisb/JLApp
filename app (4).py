@@ -902,7 +902,7 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Trend & Analysis — FINAL RULES (MTD vs Cohort with date range)
+# Trend & Analysis — FINAL RULES + FUTURE CALC
 # ----------------------------
 def ta_count_table(
     df_scope: pd.DataFrame,
@@ -925,10 +925,10 @@ def ta_count_table(
     else:
         df_work = df_scope.copy()
 
-    # Precompute create and event dates
+    # Precompute create date
     create_dt = coerce_datetime(df_work[create_col]).dt.date
 
-    # For calibration, build effective event = rescheduled if present else first
+    # Effective calibration = Rescheduled if present, else First
     if first_cal_col and first_cal_col in df_work.columns:
         first_dt = coerce_datetime(df_work[first_cal_col])
     else:
@@ -938,7 +938,7 @@ def ta_count_table(
     else:
         resch_dt = pd.Series(pd.NaT, index=df_work.index)
 
-    eff_cal = resch_dt.copy().fillna(first_dt)          # effective calibration datetime
+    eff_cal = resch_dt.copy().fillna(first_dt)
     eff_cal_date = eff_cal.dt.date
 
     # Population for MTD (deals created within range)
@@ -950,28 +950,22 @@ def ta_count_table(
 
         # Create Date (deals) — Count
         if disp == "Create Date (deals) — Count":
-            if mode == "MTD":
-                idx = pop_mask_mtd
-            else:
-                idx = create_dt.between(range_start, range_end)
+            idx = pop_mask_mtd if mode == "MTD" else create_dt.between(range_start, range_end)
             gdf = df_work.loc[idx, group_cols].copy()
             agg = gdf.assign(_one=1).groupby(group_cols)["_one"].sum().reset_index().rename(columns={"_one": disp}) if not gdf.empty else pd.DataFrame(columns=group_cols+[disp])
             outs.append(agg)
             continue
 
-        # Derived: Future Calibration Scheduled — Count (uses effective cal date)
+        # Derived: Future Calibration Session — Count (effective cal strictly after range_end)
         if disp == "Future Calibration Scheduled — Count":
             if eff_cal_date is None:
-                # No relevant columns -> zeros
-                target = df_work.loc[pop_mask_mtd if mode=="MTD" else slice(None), group_cols] if mode == "MTD" else df_work[group_cols]
+                base_idx = pop_mask_mtd if mode == "MTD" else slice(None)
+                target = df_work.loc[base_idx, group_cols] if mode == "MTD" else df_work[group_cols]
                 agg = target.assign(**{disp:0}).groupby(group_cols)[disp].sum().reset_index() if not target.empty else pd.DataFrame(columns=group_cols+[disp])
                 outs.append(agg)
                 continue
-            ev_in_range = eff_cal_date.between(range_start, range_end)
-            if mode == "MTD":
-                idx = pop_mask_mtd & ev_in_range
-            else:
-                idx = ev_in_range
+            future_mask = eff_cal_date > range_end  # STRICTLY after the selected window
+            idx = (pop_mask_mtd & future_mask) if mode == "MTD" else future_mask
             gdf = df_work.loc[idx, group_cols].copy()
             agg = gdf.assign(_one=1).groupby(group_cols)["_one"].sum().reset_index().rename(columns={"_one": disp}) if not gdf.empty else pd.DataFrame(columns=group_cols+[disp])
             outs.append(agg)
@@ -979,7 +973,7 @@ def ta_count_table(
 
         # Other event metrics (Payment, First Cal, Rescheduled, Done)
         if (not col) or (col not in df_work.columns):
-            # Missing column -> zeros over correct base
+            # Missing column -> zeros
             base_idx = pop_mask_mtd if mode == "MTD" else slice(None)
             target = df_work.loc[base_idx, group_cols] if mode == "MTD" else df_work[group_cols]
             agg = target.assign(**{disp:0}).groupby(group_cols)[disp].sum().reset_index() if not target.empty else pd.DataFrame(columns=group_cols+[disp])
@@ -990,10 +984,10 @@ def ta_count_table(
         ev_in_range = ev_date.between(range_start, range_end)
 
         if mode == "MTD":
-            # Count only if: deal is in population (created in range) AND event date also in range
+            # Count only if: deal is in population AND event date within the same range
             idx = pop_mask_mtd & ev_in_range
         else:
-            # Cohort: event date in range, ignore create
+            # Cohort: event date in range, ignore create date
             idx = ev_in_range
 
         gdf = df_work.loc[idx, group_cols].copy()
