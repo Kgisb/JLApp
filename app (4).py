@@ -1,6 +1,6 @@
 # app_8020.py
 # JetLearn: 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer
-# Month-wise view now auto-plots a bold "All Selected" line + one line per picked source.
+# Includes: Month-wise multi-line (per picked source) + NEW stacked bar (Deals Created vs Enrolments)
 # Reads Master_sheet-DB.csv from the same folder.
 
 import streamlit as st
@@ -493,7 +493,7 @@ else:
             cohort_now["_pay_m"].dropna().sort_values().unique().astype(str).tolist()
         )
 
-        # Overall totals per month (denominator)
+        # Overall totals per month (denominator for % of overall)
         overall_m = cohort_now.groupby("_pay_m").size().rename("TotalAll").reset_index()
         overall_m["Month"] = overall_m["_pay_m"].astype(str)
 
@@ -543,14 +543,12 @@ else:
             unsafe_allow_html=True,
         )
 
-        # Multi-line month-wise chart
-        # Make the "All Selected" stroke thicker
+        # Multi-line month-wise chart (All Selected = thicker stroke)
         stroke_width = alt.condition(
             "datum.Series == 'All Selected'",
-            alt.value(4),  # thicker
-            alt.value(2)   # normal
+            alt.value(4),
+            alt.value(2)
         )
-
         chart = alt.Chart(lines_df).mark_line(point=True).encode(
             x=alt.X("Month:N", sort=months_in_range, title="Month"),
             y=alt.Y("PctOfOverall:Q", title="% of overall business", scale=alt.Scale(domain=[0, 100])),
@@ -583,27 +581,146 @@ else:
                 mime="text/csv"
             )
 
-    # Detail table + download (subset of cohort in range respecting current picks)
-    with st.expander("Selected rows (cohort subset)"):
-        sel_rows_mask = pd.Series(True, index=cohort_now.index)
-        if picked_countries and country_col:
-            sel_rows_mask &= cohort_now[country_col].astype(str).isin(picked_countries)
-        if (picked_srcs or sources_for_lines) and source_col:
-            sel_rows_mask &= cohort_now["_src_pick"].isin(sources_for_lines if sources_for_lines else cohort_now["_src_pick"].unique())
+# ============================
+# NEW — Stacked Conversion Bar (Deals Created vs Enrolments)
+# ============================
+st.markdown("### Stacked Conversion Bar — Deals Created vs Enrolments")
 
-        show_cols = []
-        if source_col: show_cols.append(source_col)
-        if country_col: show_cols.append(country_col)
-        pay_display = find_col(df_raw, ["Payment Received Date","Payment Date","Paid At","Payment Received date","Payment_Received_Date"])
-        if pay_display: show_cols.append(pay_display)
-        subset = cohort_now.loc[sel_rows_mask, show_cols].copy() if show_cols else cohort_now.loc[sel_rows_mask].copy()
-        st.dataframe(subset.head(1000), use_container_width=True)
-        st.download_button(
-            "Download CSV – Selection subset",
-            data=subset.to_csv(index=False).encode("utf-8"),
-            file_name="mix_selection_subset.csv",
-            mime="text/csv"
+# Ensure df_clean has normalized _src_pick too (used for filters here)
+if source_col:
+    if use_key_sources:
+        df_clean["_src_pick"] = df_clean[source_col].apply(normalize_key_source)
+    else:
+        df_clean["_src_pick"] = df_clean[source_col].fillna("Unknown").astype(str)
+
+# Masks by window and picks (apply to df_clean)
+in_pay_window = df_clean["_pay_dt"].dt.date.between(start_d, end_d)
+in_create_window = df_clean["_create_dt"].dt.date.between(start_d, end_d)
+
+base_mask_conv = pd.Series(True, index=df_clean.index)
+if source_col and picked_sources is not None and len(picked_sources) > 0:
+    # For consistency with Mix Analyzer, if user picked only certain sources in sidebar Pareto,
+    # we'll still let the stacked bar respect the *Mix* selections (picked_srcs) if available.
+    # But if user cleared Mix selections, fall back to sidebar picks.
+    pass  # sidebar picks influence Pareto earlier; for the stacked bar we read Mix picks below.
+
+# Respect Mix picks (picked_srcs/picked_countries) if any
+if source_col and 'picked_srcs' in locals() and picked_srcs:
+    base_mask_conv &= df_clean["_src_pick"].isin(picked_srcs)
+if country_col and 'picked_countries' in locals() and picked_countries:
+    base_mask_conv &= df_clean[country_col].astype(str).isin(picked_countries)
+
+# Prepare month fields
+df_clean["_create_m"] = df_clean["_create_dt"].dt.to_period("M")
+df_clean["_pay_m"]    = df_clean["_pay_dt"].dt.to_period("M")
+
+gran = st.radio(
+    "Granularity (stacked bar)",
+    ["Month-wise", "Aggregate (single bar)"],
+    horizontal=True,
+    index=0
+)
+
+def nonneg(x):
+    try:
+        return max(0, int(x))
+    except Exception:
+        return 0
+
+if gran == "Aggregate (single bar)":
+    # Denominator = deals created in window (under filters)
+    den_mask = base_mask_conv & in_create_window
+    den_total = int(den_mask.sum())
+
+    if conv_mode == "MTD":
+        # Numerator = payments in window, among those created in window
+        num_mask = base_mask_conv & in_pay_window & in_create_window
+    else:  # Cohort
+        # Numerator = payments in window (ignore create alignment)
+        num_mask = base_mask_conv & in_pay_window
+
+    num_total = int(num_mask.sum())
+    rem_total = nonneg(den_total - num_total)
+
+    agg_df = pd.DataFrame({
+        "Bucket": ["Enrolments (Payments)", "Remaining"],
+        "Count": [num_total, rem_total]
+    })
+
+    agg_chart = alt.Chart(agg_df).mark_bar().encode(
+        x=alt.X("Count:Q", title="Count"),
+        y=alt.Y("Bucket:N", title=None),
+        color=alt.Color("Bucket:N", legend=alt.Legend(orient="bottom")),
+        tooltip=[alt.Tooltip("Bucket:N"), alt.Tooltip("Count:Q")]
+    ).properties(height=120, title=f"Aggregate • Deals Created = {den_total:,} (bar total)")
+    st.altair_chart(agg_chart, use_container_width=True)
+
+else:
+    # Month-wise — build month axis from window
+    months_all = pd.period_range(start=pd.Period(start_d, freq="M"),
+                                 end=pd.Period(end_d,   freq="M"),
+                                 freq="M")
+    months_lbl = [str(p) for p in months_all]
+
+    # Denominator by Create Month (always)
+    den_month = (
+        df_clean.loc[base_mask_conv & in_create_window]
+                .groupby("_create_m").size().rename("Created")
+                .reindex(months_all, fill_value=0)
+                .reset_index().rename(columns={"_create_m":"MonthP"})
+    )
+
+    # Numerator by month depends on mode
+    if conv_mode == "MTD":
+        # Payments counted only for deals created in the same month
+        paid_same_month = (
+            df_clean.loc[base_mask_conv & in_create_window & in_pay_window & (df_clean["_create_m"] == df_clean["_pay_m"])]
+                    .groupby("_create_m").size().rename("Enrolled")
+                    .reindex(months_all, fill_value=0).reset_index().rename(columns={"_create_m":"MonthP"})
         )
+    else:
+        # Cohort: Payments counted by Payment Month (ignoring create)
+        paid_same_month = (
+            df_clean.loc[base_mask_conv & in_pay_window]
+                    .groupby("_pay_m").size().rename("Enrolled")
+                    .reindex(months_all, fill_value=0).reset_index().rename(columns={"_pay_m":"MonthP"})
+        )
+
+    merged = den_month.merge(paid_same_month, on="MonthP", how="left").fillna({"Enrolled":0})
+    merged["Month"] = merged["MonthP"].astype(str)
+    merged["Remaining"] = (merged["Created"] - merged["Enrolled"]).clip(lower=0)
+
+    # Melt to stacked format
+    stack_df = merged.melt(
+        id_vars=["Month","Created"],
+        value_vars=["Enrolled","Remaining"],
+        var_name="Bucket",
+        value_name="Count"
+    )
+    stack_df["Month"] = pd.Categorical(stack_df["Month"], categories=months_lbl, ordered=True)
+
+    # Stacked bars (Enrolled at bottom)
+    stacked = alt.Chart(stack_df).mark_bar().encode(
+        x=alt.X("Month:N", sort=months_lbl, title="Month"),
+        y=alt.Y("Count:Q", title="Count"),
+        color=alt.Color("Bucket:N", sort=["Enrolled","Remaining"], legend=alt.Legend(orient="bottom")),
+        order=alt.Order("Bucket", sort=["Enrolled","Remaining"]),
+        tooltip=[
+            alt.Tooltip("Month:N"),
+            alt.Tooltip("Bucket:N"),
+            alt.Tooltip("Count:Q"),
+        ]
+    ).properties(height=320, title="Month-wise • Bar total = Deals Created; bottom = Enrolments")
+
+    # Optional total labels (created)
+    labels = alt.Chart(merged).mark_text(dy=-6).encode(
+        x=alt.X("Month:N", sort=months_lbl),
+        y=alt.Y("Created:Q"),
+        text=alt.Text("Created:Q"),
+        tooltip=[alt.Tooltip("Created:Q", title="Deals Created")]
+    )
+
+    st.altair_chart(stacked + labels, use_container_width=True)
 
 # ----------------------------
 # Tables + Downloads
