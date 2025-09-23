@@ -1,6 +1,6 @@
 # app_8020.py
-# Standalone Streamlit app: 80-20 Pareto + Trajectory (Top Countries × Referral/PM-Search/PM-Social)
-# + Conversion% toggle (MTD / Cohort)
+# JetLearn: 80-20 Pareto + Trajectory + Conversion% + Interactive Mix Analyzer
+# Reads Master_sheet-DB.csv from the same folder.
 
 import streamlit as st
 import pandas as pd
@@ -10,7 +10,7 @@ from datetime import date
 from calendar import monthrange
 import re
 
-st.set_page_config(page_title="JetLearn 80-20 + Trajectory + Conversion%", page_icon="📈", layout="wide")
+st.set_page_config(page_title="JetLearn 80-20 + Trajectory + Conversion% + Mix", page_icon="📈", layout="wide")
 
 # ----------------------------
 # Minimal styling
@@ -131,7 +131,7 @@ def donut_referral_share(df: pd.DataFrame, source_col: str):
         tooltip=["Category:N", "Value:Q"]
     ).properties(title="Referral vs Non-Referral (cohort)")
 
-# ---- Source normalization for the 3 key sources ----
+# ---- Map raw deal source to 3 key sources ----
 def normalize_key_source(val: str) -> str:
     if not isinstance(val, str):
         return "Other"
@@ -147,7 +147,7 @@ def normalize_key_source(val: str) -> str:
 # ----------------------------
 # Load data
 # ----------------------------
-st.title("📈 80-20 Pareto + Trajectory + Conversion%")
+st.title("📈 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer")
 
 df_raw = load_csv("Master_sheet-DB.csv")  # file must be in same folder as this app
 dealstage_col = find_col(df_raw, ["Deal Stage","Deal stage","Stage","Deal Status","Stage Name","Deal Stage Name"])
@@ -165,7 +165,7 @@ df_clean["_create_dt"] = to_datetime(df_clean[create_col]) if create_col else pd
 df_clean["_pay_m"] = df_clean["_pay_dt"].dt.to_period("M")
 
 # ----------------------------
-# Filters – Month or custom range (COHORT = Payment in range)
+# Sidebar – Cohort date scope + Conversion%
 # ----------------------------
 st.sidebar.header("Scope (Cohort)")
 unique_months = df_clean["_pay_dt"].dropna().dt.to_period("M").drop_duplicates().sort_values()
@@ -186,19 +186,26 @@ else:
         st.error("End date cannot be before start date.")
         st.stop()
 
-# ----------------------------
-# Source filter (for 80-20 view only)
-# ----------------------------
+# Source filter (for the Pareto section only)
 if source_col:
     all_sources = sorted(df_clean[source_col].dropna().astype(str).unique())
-    excl_ref = st.sidebar.checkbox("Exclude Referral (80-20 view)", value=False)
+    excl_ref = st.sidebar.checkbox("Exclude Referral (for Pareto view)", value=False)
     sources_for_pick = [s for s in all_sources if not (excl_ref and "referr" in s.lower())]
-    picked_sources = st.sidebar.multiselect("Include Deal Sources (80-20 view)", options=sources_for_pick, default=sources_for_pick)
+    picked_sources = st.sidebar.multiselect("Include Deal Sources (Pareto)", options=sources_for_pick, default=sources_for_pick)
 else:
     picked_sources = None
 
+# Conversion mode toggle
+st.sidebar.header("Conversion%")
+conv_mode = st.sidebar.radio(
+    "Mode", ["MTD", "Cohort"], index=0, horizontal=True,
+    help="MTD: Payments in range that belong to deals created in range.\n"
+         "Cohort: Payments in range (ignore Create Date).\n"
+         "Denominator for both = deals created in range."
+)
+
 # ----------------------------
-# Apply cohort filter
+# Apply cohort filter (payments within start_d..end_d)
 # ----------------------------
 scope_mask = df_clean["_pay_dt"].dt.date.between(start_d, end_d)
 df_cohort = df_clean.loc[scope_mask].copy()
@@ -206,33 +213,23 @@ if picked_sources is not None and source_col:
     df_cohort = df_cohort[df_cohort[source_col].astype(str).isin(picked_sources)]
 
 # ----------------------------
-# Conversion% toggle (MTD / Cohort)
+# Conversion% calculations
 # ----------------------------
-st.sidebar.header("Conversion%")
-conv_mode = st.sidebar.radio("Mode", ["MTD", "Cohort"], index=0, horizontal=True,
-                             help="MTD: Payments in range that belong to deals created in range.\nCohort: Payments in range (ignore Create Date).\nDenominator for both = deals created in range.")
-
-def conversion_stats(df_all: pd.DataFrame, start_d: date, end_d: date, mode: str,
-                     source_norm: bool = True):
-    """
-    Returns:
-      overall: dict(den, num, pct)
-      by_key_source: DataFrame with columns [KeySource, Den, Num, Pct]
-    """
+def conversion_stats(df_all: pd.DataFrame, start_d: date, end_d: date, mode: str):
     if create_col is None or pay_col is None:
         return {"Den": 0, "Num": 0, "Pct": 0.0}, pd.DataFrame(columns=["KeySource","Den","Num","Pct"])
 
     d = df_all.copy()
     d["_cdate"] = d["_create_dt"].dt.date
     d["_pdate"] = d["_pay_dt"].dt.date
-    d["_key_source"] = d[source_col].apply(normalize_key_source) if (source_norm and source_col) else "Other"
+    d["_key_source"] = d[source_col].apply(normalize_key_source) if source_col else "Other"
 
     denom_mask = d["_cdate"].between(start_d, end_d)
     den_overall = int(denom_mask.sum())
 
     if mode == "MTD":
         num_mask = d["_pdate"].between(start_d, end_d) & denom_mask
-    else:  # Cohort
+    else:
         num_mask = d["_pdate"].between(start_d, end_d)
 
     num_overall = int(num_mask.sum())
@@ -252,7 +249,7 @@ def conversion_stats(df_all: pd.DataFrame, start_d: date, end_d: date, mode: str
 overall_conv, bysrc_conv = conversion_stats(df_clean, start_d, end_d, conv_mode)
 
 # ----------------------------
-# 80-20 KPIs + Charts (same as earlier)
+# KPIs
 # ----------------------------
 st.markdown("<div class='section-title'>Cohort KPIs</div>", unsafe_allow_html=True)
 total_enr = int(len(df_cohort))
@@ -275,7 +272,7 @@ with k4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'># Countries 
 with k5: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Conversion% ({conv_mode})</div><div class='kpi-value'>{overall_conv['Pct']:.1f}%</div><div class='kpi-sub'>Num: {overall_conv['Num']:,} • Den: {overall_conv['Den']:,}</div></div>", unsafe_allow_html=True)
 
 # ----------------------------
-# Charts (Pareto + Referral donut)
+# 80-20 Charts
 # ----------------------------
 c1, c2 = st.columns([2,1])
 with c1: st.altair_chart(pareto_chart(src_tbl, "Deal Source", "Pareto – Enrolments by Deal Source"), use_container_width=True)
@@ -283,7 +280,7 @@ with c2: st.altair_chart(donut_referral_share(df_cohort, source_col), use_contai
 st.altair_chart(pareto_chart(cty_tbl, "Country", "Pareto – Enrolments by Country"), use_container_width=True)
 
 # ----------------------------
-# NEW: Per-key-source Conversion% chart
+# Conversion% by Key Source (bar)
 # ----------------------------
 st.markdown("### Conversion% by Key Source")
 if not bysrc_conv.empty:
@@ -305,7 +302,7 @@ st.markdown("### Trajectory – Top Countries × Referral / PM - Search / PM - S
 col_t1, col_t2 = st.columns(2)
 with col_t1:
     trailing_k = st.selectbox("Trailing window (months)", [3, 6, 12], index=0,
-                              help="Build monthly trajectory ending at your selected end date.")
+                              help="Monthly trajectory ends at your selected end date.")
 with col_t2:
     top_k = st.selectbox("Top countries (by cohort enrolments)", [5, 7], index=0)
 
@@ -315,9 +312,9 @@ months_str = [str(p) for p in months_list]
 df_trail = df_clean[df_clean["_pay_m"].isin(months_list)].copy()
 df_trail["_key_source"] = df_trail[source_col].apply(normalize_key_source) if source_col else "Other"
 
-# Top K countries by cohort counts across trailing window
+# Top K countries across trailing window
 if country_col:
-    cty_counts = (df_trail.groupby(country_col).size().sort_values(ascending=False))
+    cty_counts = df_trail.groupby(country_col).size().sort_values(ascending=False)
     top_countries = cty_counts.head(top_k).index.astype(str).tolist()
 else:
     top_countries = []
@@ -327,10 +324,7 @@ monthly_total = df_trail.groupby("_pay_m").size().rename("TotalAll").reset_index
 if top_countries and source_col and country_col:
     mcs = (
         df_trail[df_trail[country_col].astype(str).isin(top_countries)]
-        .groupby(["_pay_m", country_col, "_key_source"])
-        .size()
-        .rename("Cnt")
-        .reset_index()
+        .groupby(["_pay_m", country_col, "_key_source"]).size().rename("Cnt").reset_index()
     )
 else:
     mcs = pd.DataFrame(columns=["_pay_m", country_col if country_col else "Country", "_key_source", "Cnt"])
@@ -380,6 +374,119 @@ else:
     st.info("No data for the selected trailing window to build the trajectory.")
 
 # ----------------------------
+# Interactive Mix Analyzer — choose Sources & Countries → % of overall
+# ----------------------------
+st.markdown("### Interactive Mix Analyzer — % of overall business from your selection")
+
+col_im1, col_im2, col_im3 = st.columns([1.2, 1, 1])
+with col_im1:
+    use_key_sources = st.checkbox(
+        "Use key-source mapping (Referral / PM - Search / PM - Social)",
+        value=True,
+        help="On = group sources into the 3 key buckets. Off = use raw deal source names."
+    )
+
+# Build selectable lists from the current cohort window
+cohort_now = df_clean[df_clean["_pay_dt"].dt.date.between(start_d, end_d)].copy()
+
+# Source options
+if source_col and source_col in cohort_now.columns:
+    if use_key_sources:
+        cohort_now["_src_pick"] = cohort_now[source_col].apply(normalize_key_source)
+        src_options = ["Referral", "PM - Search", "PM - Social", "Other"]
+        default_srcs = ["Referral", "PM - Search", "PM - Social"]
+    else:
+        cohort_now["_src_pick"] = cohort_now[source_col].fillna("Unknown").astype(str)
+        src_options = sorted(cohort_now["_src_pick"].unique().tolist())
+        default_srcs = cohort_now["_src_pick"].value_counts().head(5).index.tolist()
+
+    with col_im2:
+        picked_srcs = st.multiselect(
+            "Select Deal Sources",
+            options=src_options,
+            default=[s for s in default_srcs if s in src_options]
+        )
+else:
+    picked_srcs = []
+    st.info("Deal Source column not found, source filtering disabled for Mix Analyzer.")
+
+# Country options
+if country_col and country_col in cohort_now.columns:
+    country_counts = cohort_now[country_col].astype(str).fillna("Unknown").value_counts()
+    default_countries = country_counts.head(7).index.tolist()
+    with col_im3:
+        picked_countries = st.multiselect(
+            "Select Countries",
+            options=country_counts.index.tolist(),
+            default=default_countries
+        )
+else:
+    picked_countries = []
+    st.info("Country column not found, country filtering disabled for Mix Analyzer.")
+
+# Compute % of overall
+total_payments = int(len(cohort_now))
+
+if total_payments == 0:
+    st.warning("No payments (enrolments) in the selected window.")
+else:
+    sel_mask = pd.Series([True] * len(cohort_now), index=cohort_now.index)
+    if picked_srcs and source_col:
+        sel_mask &= cohort_now["_src_pick"].isin(picked_srcs)
+    if picked_countries and country_col:
+        sel_mask &= cohort_now[country_col].astype(str).isin(picked_countries)
+
+    selected_payments = int(sel_mask.sum())
+    pct_of_overall = (selected_payments / total_payments * 100.0) if total_payments > 0 else 0.0
+
+    # KPI
+    st.markdown(
+        f"<div class='kpi-card'>"
+        f"<div class='kpi-title'>Contribution of your selection ({start_d} → {end_d})</div>"
+        f"<div class='kpi-value'>{pct_of_overall:.1f}%</div>"
+        f"<div class='kpi-sub'>Enrolments in selection: {selected_payments:,} • Total: {total_payments:,}</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Bar: selection breakdown by source as % of overall
+    breakdown = (
+        cohort_now.loc[sel_mask]
+        .groupby("_src_pick").size().rename("SelCnt").reset_index()
+        if source_col else pd.DataFrame(columns=["_src_pick","SelCnt"])
+    )
+    if not breakdown.empty:
+        breakdown["PctOfOverall"] = breakdown["SelCnt"] / total_payments * 100.0
+        breakdown = breakdown.sort_values("PctOfOverall", ascending=False)
+        chart = alt.Chart(breakdown).mark_bar(opacity=0.9).encode(
+            x=alt.X("_src_pick:N", title="Source"),
+            y=alt.Y("PctOfOverall:Q", title="% of overall business"),
+            tooltip=[
+                alt.Tooltip("_src_pick:N", title="Source"),
+                alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
+                alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f"),
+            ],
+            color=alt.Color("_src_pick:N", legend=alt.Legend(orient="bottom"))
+        ).properties(height=320, title="Selection breakdown by source — % of overall")
+        st.altair_chart(chart, use_container_width=True)
+
+    # Detail table + download
+    with st.expander("Selected rows (cohort subset)"):
+        show_cols = []
+        if source_col: show_cols.append(source_col)
+        if country_col: show_cols.append(country_col)
+        pay_display = find_col(df_raw, ["Payment Received Date","Payment Date","Paid At","Payment Received date","Payment_Received_Date"])
+        if pay_display: show_cols.append(pay_display)
+        subset = cohort_now.loc[sel_mask, show_cols].copy() if show_cols else cohort_now.loc[sel_mask].copy()
+        st.dataframe(subset.head(1000), use_container_width=True)
+        st.download_button(
+            "Download CSV – Selection subset",
+            data=subset.to_csv(index=False).encode("utf-8"),
+            file_name="mix_selection_subset.csv",
+            mime="text/csv"
+        )
+
+# ----------------------------
 # Tables + Downloads
 # ----------------------------
 st.markdown("<div class='section-title'>Tables</div>", unsafe_allow_html=True)
@@ -411,7 +518,7 @@ with tabs[2]:
                        "cohort_subset.csv", "text/csv")
 
 with tabs[3]:
-    if not mcs.empty:
+    if 'mcs' in locals() and not mcs.empty:
         show = mcs.rename(columns={country_col: "Country"})[["Country","_pay_m_str","_key_source","Cnt","TotalAll","PctOfOverall"]]
         show = show.sort_values(["Country","_pay_m_str","_key_source"])
         st.dataframe(show, use_container_width=True)
