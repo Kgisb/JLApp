@@ -1,15 +1,16 @@
 # app_8020.py
 # Standalone Streamlit app: 80-20 Pareto + Trajectory (Top Countries × Referral/PM-Search/PM-Social)
+# + Conversion% toggle (MTD / Cohort)
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import altair as alt
-from datetime import date, timedelta
+from datetime import date
 from calendar import monthrange
 import re
 
-st.set_page_config(page_title="JetLearn 80-20 + Trajectory", page_icon="📈", layout="wide")
+st.set_page_config(page_title="JetLearn 80-20 + Trajectory + Conversion%", page_icon="📈", layout="wide")
 
 # ----------------------------
 # Minimal styling
@@ -71,7 +72,6 @@ def month_bounds(d: date):
     return start, end
 
 def months_back_list(end_d: date, k: int):
-    """Return list of Period('YYYY-MM') covering the last k months ending in end_d's month (inclusive)."""
     p_end = pd.Period(end_d, freq="M")
     return [p_end - i for i in range(k-1, -1, -1)]
 
@@ -147,7 +147,7 @@ def normalize_key_source(val: str) -> str:
 # ----------------------------
 # Load data
 # ----------------------------
-st.title("📈 80-20 Pareto + Trajectory (Top Countries × Key Sources)")
+st.title("📈 80-20 Pareto + Trajectory + Conversion%")
 
 df_raw = load_csv("Master_sheet-DB.csv")  # file must be in same folder as this app
 dealstage_col = find_col(df_raw, ["Deal Stage","Deal stage","Stage","Deal Status","Stage Name","Deal Stage Name"])
@@ -206,6 +206,52 @@ if picked_sources is not None and source_col:
     df_cohort = df_cohort[df_cohort[source_col].astype(str).isin(picked_sources)]
 
 # ----------------------------
+# Conversion% toggle (MTD / Cohort)
+# ----------------------------
+st.sidebar.header("Conversion%")
+conv_mode = st.sidebar.radio("Mode", ["MTD", "Cohort"], index=0, horizontal=True,
+                             help="MTD: Payments in range that belong to deals created in range.\nCohort: Payments in range (ignore Create Date).\nDenominator for both = deals created in range.")
+
+def conversion_stats(df_all: pd.DataFrame, start_d: date, end_d: date, mode: str,
+                     source_norm: bool = True):
+    """
+    Returns:
+      overall: dict(den, num, pct)
+      by_key_source: DataFrame with columns [KeySource, Den, Num, Pct]
+    """
+    if create_col is None or pay_col is None:
+        return {"Den": 0, "Num": 0, "Pct": 0.0}, pd.DataFrame(columns=["KeySource","Den","Num","Pct"])
+
+    d = df_all.copy()
+    d["_cdate"] = d["_create_dt"].dt.date
+    d["_pdate"] = d["_pay_dt"].dt.date
+    d["_key_source"] = d[source_col].apply(normalize_key_source) if (source_norm and source_col) else "Other"
+
+    denom_mask = d["_cdate"].between(start_d, end_d)
+    den_overall = int(denom_mask.sum())
+
+    if mode == "MTD":
+        num_mask = d["_pdate"].between(start_d, end_d) & denom_mask
+    else:  # Cohort
+        num_mask = d["_pdate"].between(start_d, end_d)
+
+    num_overall = int(num_mask.sum())
+    pct_overall = (num_overall/den_overall*100.0) if den_overall > 0 else 0.0
+
+    # By key source
+    rows = []
+    for src in ["Referral", "PM - Search", "PM - Social"]:
+        src_mask = (d["_key_source"] == src)
+        den = int((denom_mask & src_mask).sum())
+        num = int((num_mask & src_mask).sum())
+        pct = (num/den*100.0) if den > 0 else 0.0
+        rows.append({"KeySource": src, "Den": den, "Num": num, "Pct": pct})
+    by_src = pd.DataFrame(rows)
+    return {"Den": den_overall, "Num": num_overall, "Pct": pct_overall}, by_src
+
+overall_conv, bysrc_conv = conversion_stats(df_clean, start_d, end_d, conv_mode)
+
+# ----------------------------
 # 80-20 KPIs + Charts (same as earlier)
 # ----------------------------
 st.markdown("<div class='section-title'>Cohort KPIs</div>", unsafe_allow_html=True)
@@ -221,23 +267,41 @@ cty_tbl = build_pareto(df_cohort, country_col, "Country") if total_enr > 0 else 
 n_sources_80 = int((src_tbl["CumPct"] <= 80).sum()) if not src_tbl.empty else 0
 n_countries_80 = int((cty_tbl["CumPct"] <= 80).sum()) if not cty_tbl.empty else 0
 
-k1, k2, k3, k4 = st.columns(4)
+k1, k2, k3, k4, k5 = st.columns(5)
 with k1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Enrollments</div><div class='kpi-value'>{total_enr:,}</div><div class='kpi-sub'>{start_d} → {end_d}</div></div>", unsafe_allow_html=True)
 with k2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Referral %</div><div class='kpi-value'>{ref_pct:.1f}%</div><div class='kpi-sub'>{ref_cnt:,} of {total_enr:,}</div></div>", unsafe_allow_html=True)
 with k3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'># Sources for 80%</div><div class='kpi-value'>{n_sources_80}</div></div>", unsafe_allow_html=True)
 with k4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'># Countries for 80%</div><div class='kpi-value'>{n_countries_80}</div></div>", unsafe_allow_html=True)
+with k5: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Conversion% ({conv_mode})</div><div class='kpi-value'>{overall_conv['Pct']:.1f}%</div><div class='kpi-sub'>Num: {overall_conv['Num']:,} • Den: {overall_conv['Den']:,}</div></div>", unsafe_allow_html=True)
 
+# ----------------------------
+# Charts (Pareto + Referral donut)
+# ----------------------------
 c1, c2 = st.columns([2,1])
 with c1: st.altair_chart(pareto_chart(src_tbl, "Deal Source", "Pareto – Enrolments by Deal Source"), use_container_width=True)
 with c2: st.altair_chart(donut_referral_share(df_cohort, source_col), use_container_width=True)
 st.altair_chart(pareto_chart(cty_tbl, "Country", "Pareto – Enrolments by Country"), use_container_width=True)
 
 # ----------------------------
-# NEW: Trajectory – Top Countries × (Referral, PM-Search, PM-Social)
+# NEW: Per-key-source Conversion% chart
+# ----------------------------
+st.markdown("### Conversion% by Key Source")
+if not bysrc_conv.empty:
+    conv_chart = alt.Chart(bysrc_conv).mark_bar(opacity=0.9).encode(
+        x=alt.X("KeySource:N", sort=["Referral","PM - Search","PM - Social"], title="Source"),
+        y=alt.Y("Pct:Q", title="Conversion%"),
+        tooltip=[alt.Tooltip("KeySource:N"), alt.Tooltip("Den:Q", title="Deals (Den)"),
+                 alt.Tooltip("Num:Q", title="Enrolments (Num)"), alt.Tooltip("Pct:Q", title="Conversion%", format=".1f")]
+    ).properties(height=300, title=f"Conversion% ({conv_mode}) • Den = Create Date in range • Num = Payments in range")
+    st.altair_chart(conv_chart, use_container_width=True)
+else:
+    st.info("No data to compute Conversion% by key source for this window.")
+
+# ----------------------------
+# Trajectory – Top Countries × (Referral, PM - Search, PM - Social)
 # ----------------------------
 st.markdown("### Trajectory – Top Countries × Referral / PM - Search / PM - Social")
 
-# Controls for trajectory
 col_t1, col_t2 = st.columns(2)
 with col_t1:
     trailing_k = st.selectbox("Trailing window (months)", [3, 6, 12], index=0,
@@ -245,25 +309,21 @@ with col_t1:
 with col_t2:
     top_k = st.selectbox("Top countries (by cohort enrolments)", [5, 7], index=0)
 
-# Determine trailing months list up to end_d
 months_list = months_back_list(end_d, trailing_k)
 months_str = [str(p) for p in months_list]
 
-# Build a working frame limited to these months (by pay-month)
 df_trail = df_clean[df_clean["_pay_m"].isin(months_list)].copy()
 df_trail["_key_source"] = df_trail[source_col].apply(normalize_key_source) if source_col else "Other"
 
-# Determine Top K countries by cohort counts over selected trailing window (all sources)
+# Top K countries by cohort counts across trailing window
 if country_col:
     cty_counts = (df_trail.groupby(country_col).size().sort_values(ascending=False))
     top_countries = cty_counts.head(top_k).index.astype(str).tolist()
 else:
     top_countries = []
 
-# Monthly totals across ALL countries (denominator = total business per month)
 monthly_total = df_trail.groupby("_pay_m").size().rename("TotalAll").reset_index()
 
-# Monthly counts for (Top country × key source)
 if top_countries and source_col and country_col:
     mcs = (
         df_trail[df_trail[country_col].astype(str).isin(top_countries)]
@@ -275,17 +335,12 @@ if top_countries and source_col and country_col:
 else:
     mcs = pd.DataFrame(columns=["_pay_m", country_col if country_col else "Country", "_key_source", "Cnt"])
 
-# Merge to compute % of OVERALL business
 if not mcs.empty:
     mcs = mcs.merge(monthly_total, on="_pay_m", how="left")
     mcs["PctOfOverall"] = np.where(mcs["TotalAll"]>0, mcs["Cnt"]/mcs["TotalAll"]*100.0, 0.0)
-    # Keep only the 3 key sources
     mcs = mcs[mcs["_key_source"].isin(["Referral", "PM - Search", "PM - Social"])]
-    # Ensure month order
-    mcs["_pay_m_str"] = mcs["_pay_m"].astype(str)
-    mcs["_pay_m_str"] = pd.Categorical(mcs["_pay_m_str"], categories=months_str, ordered=True)
+    mcs["_pay_m_str"] = pd.Categorical(mcs["_pay_m"].astype(str), categories=months_str, ordered=True)
 
-# Chart 1: Faceted stacked bars – each country as a facet, x=month, y=% of overall, color=source
 if not mcs.empty:
     facet_chart = alt.Chart(mcs).mark_bar(opacity=0.9).encode(
         x=alt.X("_pay_m_str:N", title="Month", sort=months_str),
@@ -303,11 +358,7 @@ if not mcs.empty:
         column=alt.Column(f"{country_col}:N", title="Top Countries", sort=top_countries)
     )
     st.altair_chart(facet_chart, use_container_width=True)
-else:
-    st.info("No data found for the selected trailing window and columns to build the trajectory.")
 
-# Chart 2: Overall lines across top countries – % of overall by source (summing the top countries)
-if not mcs.empty:
     overall = (
         mcs.groupby(["_pay_m_str","_key_source"], as_index=False)
            .agg({"Cnt":"sum", "TotalAll":"first"})
@@ -325,12 +376,14 @@ if not mcs.empty:
         ]
     ).properties(title="Overall contribution of key sources (restricted to Top countries)", height=320)
     st.altair_chart(lines, use_container_width=True)
+else:
+    st.info("No data for the selected trailing window to build the trajectory.")
 
 # ----------------------------
 # Tables + Downloads
 # ----------------------------
 st.markdown("<div class='section-title'>Tables</div>", unsafe_allow_html=True)
-tabs = st.tabs(["Deal Source 80-20", "Country 80-20", "Cohort Rows", "Trajectory table"])
+tabs = st.tabs(["Deal Source 80-20", "Country 80-20", "Cohort Rows", "Trajectory table", "Conversion by Source"])
 
 with tabs[0]:
     if src_tbl.empty: st.info("No enrollments in scope.")
@@ -359,7 +412,6 @@ with tabs[2]:
 
 with tabs[3]:
     if not mcs.empty:
-        tcols = [c for c in [country_col, "_pay_m_str", "_key_source", "Cnt", "TotalAll", "PctOfOverall"] if c in mcs.columns or c in ["_pay_m_str","_key_source","Cnt","TotalAll","PctOfOverall"]]
         show = mcs.rename(columns={country_col: "Country"})[["Country","_pay_m_str","_key_source","Cnt","TotalAll","PctOfOverall"]]
         show = show.sort_values(["Country","_pay_m_str","_key_source"])
         st.dataframe(show, use_container_width=True)
@@ -367,3 +419,12 @@ with tabs[3]:
                            "trajectory_top_countries_sources.csv", "text/csv")
     else:
         st.info("No trajectory table for the current selection.")
+
+with tabs[4]:
+    if not bysrc_conv.empty:
+        st.dataframe(bysrc_conv, use_container_width=True)
+        st.download_button("Download CSV – Conversion by Key Source",
+                           bysrc_conv.to_csv(index=False).encode("utf-8"),
+                           "conversion_by_key_source.csv", "text/csv")
+    else:
+        st.info("No conversion table for the current selection.")
