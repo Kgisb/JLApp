@@ -330,12 +330,6 @@ def prepare_counts_for_range(
     }
     return mtd_counts, cohort_counts
 
-def deals_created_mask_anchor(df: pd.DataFrame, running_month_any_date: date, create_col: str) -> pd.Series:
-    d = df.copy()
-    d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
-    m_start, m_end = month_bounds(running_month_any_date)
-    return d["_create_dt"].between(m_start, m_end)
-
 def deals_created_mask_range(df: pd.DataFrame, denom_start: date, denom_end: date, create_col: str) -> pd.Series:
     d = df.copy()
     d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
@@ -349,25 +343,14 @@ def prepare_conversion_for_range(
     pay_col: str,
     pipeline_col: str | None,
     *,
-    denom_mode: str = "anchor",
-    running_month_anchor: date | None = None,
-    denom_start: date | None = None,
-    denom_end: date | None = None
+    denom_start: date,
+    denom_end: date
 ):
     d = df.copy()
     d["_create_dt"] = coerce_datetime(d[create_col]).dt.date
     d["_pay_dt"] = coerce_datetime(d[pay_col]).dt.date
 
-    if denom_mode == "range":
-        if denom_start is None or denom_end is None:
-            zero = {"Total":0.0,"AI Coding":0.0,"Math":0.0}
-            return zero, zero, {"Total":0,"AI Coding":0,"Math":0}, {"mtd": {}, "cohort": {}}
-        denom_mask = deals_created_mask_range(d, denom_start, denom_end, create_col)
-    else:
-        if running_month_anchor is None:
-            zero = {"Total":0.0,"AI Coding":0.0,"Math":0.0}
-            return zero, zero, {"Total":0,"AI Coding":0,"Math":0}, {"mtd": {}, "cohort": {}}
-        denom_mask = deals_created_mask_anchor(d, running_month_anchor, create_col)
+    denom_mask = deals_created_mask_range(d, denom_start, denom_end, create_col)
 
     if pipeline_col and pipeline_col in d.columns:
         pl = d[pipeline_col].map(normalize_pipeline).fillna("Other")
@@ -423,56 +406,10 @@ def bubble_chart_counts(title: str, total: int, ai_cnt: int, math_cnt: int, labe
     text = base.mark_text(fontWeight="bold", dy=0, color="#111827").encode(text=alt.Text("Value:Q"))
     return (circles + text).properties(height=360, title=title)
 
-def bullet_gauge(percent: float, title: str, series_color: str, numerator: int, denominator: int, thresholds=(10, 20)):
-    p = float(max(0.0, min(100.0, percent)))
-    low, mid = thresholds
-    bg = pd.DataFrame([
-        {"band": "low",  "start": 0,   "end": low},
-        {"band": "mid",  "start": low, "end": mid},
-        {"band": "high", "start": mid, "end": 100},
-    ])
-    fg = pd.DataFrame([{"start": 0, "end": p, "title": title, "percent": f"{p:.1f}%", "num": numerator, "den": denominator}])
-
-    base = alt.Chart(bg).mark_bar(height=18).encode(
-        x=alt.X("start:Q", axis=None, scale=alt.Scale(domain=[0,100])),
-        x2="end:Q",
-        color=alt.Color("band:N", scale=alt.Scale(
-            domain=["low","mid","high"],
-            range=[PALETTE["ThresholdLow"], PALETTE["ThresholdMid"], PALETTE["ThresholdHigh"]]),
-            legend=None),
-    ).properties(height=32, width=360)
-
-    value_bar = alt.Chart(fg).mark_bar(height=18, cornerRadius=4).encode(
-        x=alt.X("start:Q", axis=None, scale=alt.Scale(domain=[0,100])),
-        x2="end:Q",
-        color=alt.value(series_color),
-        tooltip=[
-            alt.Tooltip("title:N", title="Series"),
-            alt.Tooltip("percent:N", title="Conversion %"),
-            alt.Tooltip("num:Q", title="Numerator"),
-            alt.Tooltip("den:Q", title="Denominator"),
-        ],
-    )
-
-    needle = alt.Chart(pd.DataFrame({"val":[p]})).mark_rule(strokeWidth=2).encode(
-        x=alt.X("val:Q", scale=alt.Scale(domain=[0,100])),
-        color=alt.value("#111827"),
-    )
-
-    label_left = alt.Chart(pd.DataFrame({"t":[title]})).mark_text(
-        align="left", baseline="middle", dx=-6, color="#374151", fontSize=12
-    ).encode(text="t:N").properties(width=0)
-
-    label_right = alt.Chart(pd.DataFrame({"p":[f"{p:.1f}%"]})).mark_text(
-        align="left", baseline="middle", dx=8, color="#111827", fontSize=12, fontWeight="bold"
-    ).encode(text="p:N").properties(width=0)
-
-    return alt.hconcat(label_left, (base + value_bar + needle), label_right).resolve_scale(x="shared")
-
-def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict, labels: list[str]):
+# ---- NEW: KPI-only block (no progress bars) ----
+def conversion_kpis_only(title: str, pcts: dict, nums: dict, denoms: dict, labels: list[str]):
     st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
     order = [l for l in ["Total", "AI Coding", "Math"] if l in labels]
-
     cols = st.columns(len(order))
     for i, label in enumerate(order):
         color = {"Total":"#111827","AI Coding":PALETTE["AI Coding"],"Math":PALETTE["Math"]}[label]
@@ -484,19 +421,13 @@ def bullet_group(title: str, pcts: dict, nums: dict, denoms: dict, labels: list[
                 unsafe_allow_html=True,
             )
 
-    for label in order:
-        series_color = {"Total": PALETTE["Total"], "AI Coding": PALETTE["AI Coding"], "Math": PALETTE["Math"]}[label]
-        st.altair_chart(bullet_gauge(pcts[label], label, series_color, nums.get(label,0), denoms.get(label,0)), use_container_width=True)
-
 def trend_timeseries(
     df: pd.DataFrame,
     payments_start: date,
     payments_end: date,
     *,
-    denom_mode: str = "anchor",
-    running_month_anchor: date | None = None,
-    denom_start: date | None = None,
-    denom_end: date | None = None,
+    denom_start: date,
+    denom_end: date,
     create_col: str = "",
     pay_col: str = ""
 ):
@@ -504,20 +435,9 @@ def trend_timeseries(
     df["_create_dt"] = coerce_datetime(df[create_col]).dt.date
     df["_pay_dt"] = coerce_datetime(df[pay_col]).dt.date
 
-    base_start = payments_start
-    base_end = payments_end
-
-    if denom_mode == "range" and denom_start and denom_end:
-        base_start = min(base_start, denom_start)
-        base_end = max(base_end, denom_end)
-        denom_mask = df["_create_dt"].between(denom_start, denom_end)
-    else:
-        if not running_month_anchor:
-            running_month_anchor = payments_start
-        m_start, m_end = month_bounds(running_month_anchor)
-        base_start = min(base_start, m_start)
-        base_end = max(base_end, m_end)
-        denom_mask = df["_create_dt"].between(m_start, m_end)
+    base_start = min(payments_start, denom_start)
+    base_end = max(payments_end, denom_end)
+    denom_mask = df["_create_dt"].between(denom_start, denom_end)
 
     all_days = pd.date_range(base_start, base_end, freq="D").date
 
@@ -807,7 +727,7 @@ def render_period_block(
     st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
     labels = active_labels(track)
 
-    # Counts (kept as-is, based on running-month anchor for MTD)
+    # Counts
     mtd_counts, coh_counts = prepare_counts_for_range(
         df_scope, range_start, range_end, running_month_anchor, create_col, pay_col, pipeline_col
     )
@@ -822,20 +742,20 @@ def render_period_block(
                                             coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"],
                                             labels=labels), use_container_width=True)
 
-    # >>> CHANGED: denominator == deals created within the SELECTED payments window
+    # Conversion% (denominator = create dates within selected window) — KPI only (NO progress bars)
     mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
         df_scope, range_start, range_end, create_col, pay_col, pipeline_col,
-        denom_mode="range", denom_start=range_start, denom_end=range_end
+        denom_start=range_start, denom_end=range_end
     )
     st.caption("Denominators (selected window create dates) — " +
                " • ".join([f"{lbl}: {denoms.get(lbl,0):,}" for lbl in labels]))
 
-    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms, labels=labels)
-    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms, labels=labels)
+    conversion_kpis_only("MTD Conversion %", mtd_pct, nums["mtd"], denoms, labels=labels)
+    conversion_kpis_only("Cohort Conversion %", coh_pct, nums["cohort"], denoms, labels=labels)
 
-    # >>> CHANGED: trend uses the SAME population rule (create dates in selected window)
+    # Trend uses the SAME population rule (create dates in selected window)
     ts = trend_timeseries(df_scope, range_start, range_end,
-                          denom_mode="range", denom_start=range_start, denom_end=range_end,
+                          denom_start=range_start, denom_end=range_end,
                           create_col=create_col, pay_col=pay_col)
     st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
@@ -880,11 +800,19 @@ if view == "MIS":
                     c1, c2 = st.columns(2)
                     with c1: st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"], labels=active_labels(track)), use_container_width=True)
                     with c2: st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"], labels=active_labels(track)), use_container_width=True)
-                    mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(df_f, custom_start, custom_end, create_col, pay_col, pipeline_col, denom_mode="anchor", running_month_anchor=anchor)
+
+                    mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
+                        df_f, custom_start, custom_end, create_col, pay_col, pipeline_col,
+                        denom_start=anchor.replace(day=1),  # keep denominator aligned to anchor month bounds
+                        denom_end=month_bounds(anchor)[1]
+                    )
                     st.caption("Denominators — " + " • ".join([f"{lbl}: {denoms.get(lbl,0):,}" for lbl in active_labels(track)]))
-                    bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms, labels=active_labels(track))
-                    bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms, labels=active_labels(track))
-                    ts = trend_timeseries(df_f, custom_start, custom_end, denom_mode="anchor", running_month_anchor=anchor, create_col=create_col, pay_col=pay_col)
+                    conversion_kpis_only("MTD Conversion %", mtd_pct, nums["mtd"], denoms, labels=active_labels(track))
+                    conversion_kpis_only("Cohort Conversion %", coh_pct, nums["cohort"], denoms, labels=active_labels(track))
+
+                    ts = trend_timeseries(df_f, custom_start, custom_end,
+                                          denom_start=anchor.replace(day=1), denom_end=month_bounds(anchor)[1],
+                                          create_col=create_col, pay_col=pay_col)
                     st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
                 else:
                     cold1, cold2 = st.columns(2)
@@ -898,11 +826,18 @@ if view == "MIS":
                         c1, c2 = st.columns(2)
                         with c1: st.altair_chart(bubble_chart_counts("MTD Enrolments (counts)", mtd_counts["Total"], mtd_counts["AI Coding"], mtd_counts["Math"], labels=active_labels(track)), use_container_width=True)
                         with c2: st.altair_chart(bubble_chart_counts("Cohort Enrolments (counts)", coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"], labels=active_labels(track)), use_container_width=True)
-                        mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(df_f, custom_start, custom_end, create_col, pay_col, pipeline_col, denom_mode="range", denom_start=denom_start, denom_end=denom_end)
+
+                        mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
+                            df_f, custom_start, custom_end, create_col, pay_col, pipeline_col,
+                            denom_start=denom_start, denom_end=denom_end
+                        )
                         st.caption("Denominators — " + " • ".join([f"{lbl}: {denoms.get(lbl,0):,}" for lbl in active_labels(track)]))
-                        bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms, labels=active_labels(track))
-                        bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms, labels=active_labels(track))
-                        ts = trend_timeseries(df_f, custom_start, custom_end, denom_mode="range", denom_start=denom_start, denom_end=denom_end, create_col=create_col, pay_col=pay_col)
+                        conversion_kpis_only("MTD Conversion %", mtd_pct, nums["mtd"], denoms, labels=active_labels(track))
+                        conversion_kpis_only("Cohort Conversion %", coh_pct, nums["cohort"], denoms, labels=active_labels(track))
+
+                        ts = trend_timeseries(df_f, custom_start, custom_end,
+                                              denom_start=denom_start, denom_end=denom_end,
+                                              create_col=create_col, pay_col=pay_col)
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
