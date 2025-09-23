@@ -500,7 +500,7 @@ def trend_timeseries(
     df: pd.DataFrame,
     payments_start: date,
     payments_end: date,
-    *,
+    * ,
     denom_mode: str = "anchor",
     running_month_anchor: date | None = None,
     denom_start: date | None = None,
@@ -1034,8 +1034,40 @@ if view == "Trend & Analysis":
     # Mode toggle
     level = st.radio("Mode", ["MTD", "Cohort"], index=0, horizontal=True)
 
-    # Month picker (single month) — one control, interpretation differs by mode
-    month_pick = st.date_input("Select month (any date within the month)", value=today)
+    # ---- NEW: Month scope selector (This month / Last month / Custom single-month range) ----
+    date_mode = st.radio(
+        "Date scope",
+        ["This month", "Last month", "Custom date range"],
+        index=0,
+        horizontal=True
+    )
+
+    if date_mode == "This month":
+        month_pick = today
+        st.caption(f"Using **this month**: {today.strftime('%b %Y')}")
+    elif date_mode == "Last month":
+        lm_start, lm_end = last_month_bounds(today)
+        month_pick = lm_start
+        st.caption(f"Using **last month**: {lm_start.strftime('%b %Y')}")
+    else:
+        col_d1, col_d2 = st.columns(2)
+        with col_d1:
+            custom_start = st.date_input("Start date", value=today.replace(day=1))
+        with col_d2:
+            _m_start, _m_end = month_bounds(custom_start)
+            custom_end = st.date_input("End date", value=_m_end)
+
+        if custom_end < custom_start:
+            st.error("End date cannot be before start date.")
+            st.stop()
+
+        # Keep TA logic unchanged by enforcing single-month custom range
+        if (custom_start.year, custom_start.month) != (custom_end.year, custom_end.month):
+            st.error("Pick a custom range within a single calendar month.")
+            st.stop()
+
+        month_pick = custom_start
+        st.caption(f"Using **custom month**: {custom_start.strftime('%b %Y')} (from {custom_start} to {custom_end})")
 
     # Metric picker
     all_metrics = [
