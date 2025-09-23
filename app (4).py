@@ -807,6 +807,7 @@ def render_period_block(
     st.markdown(f"<div class='section-title'>{title}</div>", unsafe_allow_html=True)
     labels = active_labels(track)
 
+    # Counts (kept as-is, based on running-month anchor for MTD)
     mtd_counts, coh_counts = prepare_counts_for_range(
         df_scope, range_start, range_end, running_month_anchor, create_col, pay_col, pipeline_col
     )
@@ -821,17 +822,20 @@ def render_period_block(
                                             coh_counts["Total"], coh_counts["AI Coding"], coh_counts["Math"],
                                             labels=labels), use_container_width=True)
 
+    # >>> CHANGED: denominator == deals created within the SELECTED payments window
     mtd_pct, coh_pct, denoms, nums = prepare_conversion_for_range(
         df_scope, range_start, range_end, create_col, pay_col, pipeline_col,
-        denom_mode="anchor", running_month_anchor=running_month_anchor
+        denom_mode="range", denom_start=range_start, denom_end=range_end
     )
-    st.caption("Denominators — " + " • ".join([f"{lbl}: {denoms.get(lbl,0):,}" for lbl in labels]))
+    st.caption("Denominators (selected window create dates) — " +
+               " • ".join([f"{lbl}: {denoms.get(lbl,0):,}" for lbl in labels]))
 
     bullet_group("MTD Conversion %", mtd_pct, nums["mtd"], denoms, labels=labels)
     bullet_group("Cohort Conversion %", coh_pct, nums["cohort"], denoms, labels=labels)
 
+    # >>> CHANGED: trend uses the SAME population rule (create dates in selected window)
     ts = trend_timeseries(df_scope, range_start, range_end,
-                          denom_mode="anchor", running_month_anchor=running_month_anchor,
+                          denom_mode="range", denom_start=range_start, denom_end=range_end,
                           create_col=create_col, pay_col=pay_col)
     st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
