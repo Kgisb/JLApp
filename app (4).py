@@ -1,5 +1,5 @@
 # app_8020.py
-# JetLearn: 80-20 Pareto + Trajectory + Conversion% + Interactive Mix Analyzer (with Month-wise view)
+# JetLearn: 80-20 Pareto + Trajectory + Conversion% + Interactive Mix Analyzer (with Month-wise + extra comparison lines)
 # Reads Master_sheet-DB.csv from the same folder.
 
 import streamlit as st
@@ -423,7 +423,7 @@ else:
     picked_countries = []
     st.info("Country column not found, country filtering disabled for Mix Analyzer.")
 
-# ---- NEW: Month-wise view toggle
+# ---- Month-wise view toggle + NEW extra-lines picker
 mix_view = st.radio(
     "Mix view",
     ["Aggregate (range total)", "Month-wise"],
@@ -509,7 +509,7 @@ else:
             unsafe_allow_html=True,
         )
 
-        # Line: selection % of overall by month
+        # Line: selection % of overall by month (main line)
         line = alt.Chart(mix).mark_line(point=True).encode(
             x=alt.X("_pay_m_str:N", title="Month", sort=months_in_range),
             y=alt.Y("PctOfOverall:Q", title="% of overall business", scale=alt.Scale(domain=[0, 100])),
@@ -522,12 +522,87 @@ else:
         ).properties(height=320, title="Your selection — % of overall business by month")
         st.altair_chart(line, use_container_width=True)
 
+        # NEW: Additional comparison line graph by Source or Country (using picked items only)
+        compare_by = st.selectbox(
+            "Additional line chart by",
+            ["None", "Source (picked)", "Country (picked)"],
+            index=0,
+            help="Draw separate lines per picked Source or Country, each as % of overall per month."
+        )
+
+        if compare_by != "None":
+            # base frame for denominators
+            base_overall = overall_m.rename(columns={"_pay_m":"Period"})
+            base_overall["Month"] = base_overall["_pay_m_str"]
+            base_overall = base_overall[["Period","Month","TotalAll"]]
+
+            if compare_by == "Source (picked)" and picked_srcs and source_col:
+                grp = "_src_pick"
+                # limit to selected countries as well
+                mask_cmp = pd.Series([True]*len(cohort_now), index=cohort_now.index)
+                mask_cmp &= cohort_now["_src_pick"].isin(picked_srcs)
+                if picked_countries and country_col:
+                    mask_cmp &= cohort_now[country_col].astype(str).isin(picked_countries)
+
+                comp = (
+                    cohort_now.loc[mask_cmp]
+                    .groupby(["_pay_m", grp]).size().rename("SelCnt").reset_index()
+                    .rename(columns={"_pay_m":"Period"})
+                )
+                comp["Month"] = comp["Period"].astype(str)
+                comp = comp.merge(base_overall, on="Period", how="left")
+                comp["PctOfOverall"] = np.where(comp["TotalAll"]>0, comp["SelCnt"]/comp["TotalAll"]*100.0, 0.0)
+                comp["Month"] = pd.Categorical(comp["Month"], categories=months_in_range, ordered=True)
+
+                comp_line = alt.Chart(comp).mark_line(point=True).encode(
+                    x=alt.X("Month:N", title="Month", sort=months_in_range),
+                    y=alt.Y("PctOfOverall:Q", title="% of overall (by source)", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color(f"{grp}:N", title="Source"),
+                    tooltip=[
+                        alt.Tooltip("Month:N"),
+                        alt.Tooltip(f"{grp}:N", title="Source"),
+                        alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
+                        alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f"),
+                    ],
+                ).properties(height=320, title="Additional: Source-wise % of overall by month")
+                st.altair_chart(comp_line, use_container_width=True)
+
+            if compare_by == "Country (picked)" and picked_countries and country_col:
+                grp = country_col
+                # limit to selected sources as well
+                mask_cmp = pd.Series([True]*len(cohort_now), index=cohort_now.index)
+                if picked_srcs and source_col:
+                    mask_cmp &= cohort_now["_src_pick"].isin(picked_srcs)
+                mask_cmp &= cohort_now[country_col].astype(str).isin(picked_countries)
+
+                comp = (
+                    cohort_now.loc[mask_cmp]
+                    .groupby(["_pay_m", grp]).size().rename("SelCnt").reset_index()
+                    .rename(columns={"_pay_m":"Period"})
+                )
+                comp["Month"] = comp["Period"].astype(str)
+                comp = comp.merge(base_overall, on="Period", how="left")
+                comp["PctOfOverall"] = np.where(comp["TotalAll"]>0, comp["SelCnt"]/comp["TotalAll"]*100.0, 0.0)
+                comp["Month"] = pd.Categorical(comp["Month"], categories=months_in_range, ordered=True)
+
+                comp_line = alt.Chart(comp).mark_line(point=True).encode(
+                    x=alt.X("Month:N", title="Month", sort=months_in_range),
+                    y=alt.Y("PctOfOverall:Q", title="% of overall (by country)", scale=alt.Scale(domain=[0, 100])),
+                    color=alt.Color(f"{grp}:N", title="Country"),
+                    tooltip=[
+                        alt.Tooltip("Month:N"),
+                        alt.Tooltip(f"{grp}:N", title="Country"),
+                        alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
+                        alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f"),
+                    ],
+                ).properties(height=320, title="Additional: Country-wise % of overall by month")
+                st.altair_chart(comp_line, use_container_width=True)
+
         # Optional: stacked bars by source per month as % of overall
         show_source_breakdown = st.checkbox(
             "Show month-wise source breakdown (stacked bars, % of overall)", value=False
         )
         if show_source_breakdown and source_col:
-            # Per month, per source within selection
             sel_src_m = (
                 cohort_now.loc[sel_mask]
                 .groupby(["_pay_m","_src_pick"]).size().rename("SelCnt").reset_index()
@@ -563,7 +638,7 @@ else:
                 mime="text/csv"
             )
 
-    # Detail table + download (aggregate mode always available)
+    # Detail table + download (aggregate/month-wise)
     with st.expander("Selected rows (cohort subset)"):
         show_cols = []
         if source_col: show_cols.append(source_col)
