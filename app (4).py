@@ -293,7 +293,7 @@ if track != "Both":
     else:
         st.warning("Pipeline column not found — the Track filter can’t be applied.", icon="⚠️")
 
-st.caption(f"Rows in scope after filters: **{len(df_f):,}**")
+st.caption(f"Rows in scope after filters: **{len[df_f]:,}**" if hasattr(len, "__call__") else f"Rows in scope after filters: **{len(df_f):,}**")
 st.caption(f"Track filter: **{track}**")
 
 # ----------------------------
@@ -910,26 +910,36 @@ if view == "MIS":
                         st.altair_chart(trend_chart(ts, "Trend: Leads (bars) vs Enrolments (lines)"), use_container_width=True)
 
 # ----------------------------
-# Trend & Analysis — CORRECTED (MTD population filter, Cohort event-month)
+# Trend & Analysis — CORRECTED + Derived "Future Calibration Scheduled — Count"
 # ----------------------------
 def ta_count_table(
     df_scope: pd.DataFrame,
     group_cols: list[str],
     mode: str,            # "MTD" or "Cohort"
-    month_pick: date,     # a date within the chosen month
+    month_pick: date,     # any date within the chosen month
     create_col: str,
-    metric_cols: dict,    # display_name -> column_name (or create_col for create metric)
+    metric_cols: dict,    # display_name -> column_name
     metrics_selected: list[str],
+    *,
+    cutoff_date: date,    # NEW: end of scope for "Future Calibration Scheduled"
+    first_cal_col: str | None,
+    cal_resched_col: str | None,
 ) -> pd.DataFrame:
     """
     MTD:
-      - Filter rows to Create Date in selected month.
-      - For each event metric: count non-null event value (no event-date filter).
-      - Create Date (deals) — Count = number of rows in this population.
+      - Population = deals created in selected month.
+      - Event metrics: count non-null values (no event-date filter).
+      - Create Date (deals) — Count: population size.
+      - Future Calibration Scheduled — Count:
+          Effective cal date = Rescheduled if present else First Scheduled.
+          Count rows in population with effective_cal_date > cutoff_date.
     Cohort:
       - No create-date restriction.
-      - For each event metric: count rows with event date in selected month.
-      - Create Date (deals) — Count = rows with Create Date in selected month.
+      - Event metrics: count rows where event date lies in the selected month.
+      - Create Date (deals) — Count: rows with Create Date in selected month.
+      - Future Calibration Scheduled — Count:
+          Effective cal date as above, across all rows (ignore create date),
+          Count rows with effective_cal_date > cutoff_date.
     """
     if not group_cols:
         df_work = df_scope.copy()
@@ -940,29 +950,59 @@ def ta_count_table(
 
     m_start, m_end = month_bounds(month_pick)
 
-    # Precompute create date & period
+    # Precompute create date
     df_work["_create_dt"] = coerce_datetime(df_work[create_col]).dt.date
 
+    # Build effective calibration date (rescheduled takes precedence over first scheduled)
+    eff_cal = None
+    if first_cal_col or cal_resched_col:
+        first_dt = coerce_datetime(df_work[first_cal_col]).dt.date if first_cal_col and first_cal_col in df_work.columns else pd.Series(pd.NaT, index=df_work.index)
+        resch_dt = coerce_datetime(df_work[cal_resched_col]).dt.date if cal_resched_col and cal_resched_col in df_work.columns else pd.Series(pd.NaT, index=df_work.index)
+        # np.where with object dtype dates; convert to Series of dates
+        eff_cal = pd.Series(np.where(resch_dt.notna(), resch_dt, first_dt), index=df_work.index)
+    # Population for MTD
     if mode == "MTD":
-        # Population = deals created in the selected month
         pop_mask = df_work["_create_dt"].between(m_start, m_end)
         pop = df_work.loc[pop_mask].copy()
     else:
         pop = df_work.copy()
 
-    # Build per-metric aggregates
     outs = []
     for disp in metrics_selected:
         col = metric_cols.get(disp)
 
+        # Create Date (deals) — Count
         if disp == "Create Date (deals) — Count":
             if mode == "MTD":
-                # Count of deals created in month (population size)
                 gdf = pop[group_cols].copy()
             else:
-                # Cohort: number of deals created in the selected month
                 mask = df_work["_create_dt"].between(m_start, m_end)
                 gdf = df_work.loc[mask, group_cols].copy()
+            if gdf.empty:
+                agg = pd.DataFrame(columns=group_cols + [disp])
+            else:
+                agg = gdf.assign(_one=1).groupby(group_cols)["_one"].sum().reset_index().rename(columns={"_one": disp})
+            outs.append(agg)
+            continue
+
+        # NEW: Future Calibration Scheduled — Count
+        if disp == "Future Calibration Scheduled — Count":
+            if eff_cal is None:
+                # If no relevant columns, just zeros
+                target = pop if mode == "MTD" else df_work
+                if target.empty:
+                    agg = pd.DataFrame(columns=group_cols + [disp])
+                else:
+                    agg = target[group_cols].assign(**{disp: 0}).groupby(group_cols)[disp].sum().reset_index()
+                outs.append(agg)
+                continue
+
+            mask_future = eff_cal.gt(cutoff_date)
+            if mode == "MTD":
+                # restrict to population created in selected month
+                gdf = pop.loc[mask_future.loc[pop.index], group_cols].copy()
+            else:
+                gdf = df_work.loc[mask_future, group_cols].copy()
 
             if gdf.empty:
                 agg = pd.DataFrame(columns=group_cols + [disp])
@@ -971,25 +1011,24 @@ def ta_count_table(
             outs.append(agg)
             continue
 
-        # Event metrics
+        # Event metrics (legacy ones)
         if not col or col not in df_work.columns:
             # Missing column → zeros
-            if pop.empty:
+            target = pop if mode == "MTD" else df_work
+            if target.empty:
                 agg = pd.DataFrame(columns=group_cols + [disp])
             else:
-                agg = pop[group_cols].assign(**{disp: 0}).groupby(group_cols)[disp].sum().reset_index()
+                agg = target[group_cols].assign(**{disp: 0}).groupby(group_cols)[disp].sum().reset_index()
             outs.append(agg)
             continue
 
-        # Coerce event date
         ev = coerce_datetime(df_work[col]).dt.date
-
         if mode == "MTD":
-            # From population created in month, count non-null events (any time)
+            # Count non-null events for population created in selected month (any time)
             mask_nonnull = df_work[col].notna()
             gdf = pop.loc[mask_nonnull.loc[pop.index], group_cols].copy()
         else:
-            # Cohort: count events whose date lies in the chosen month, regardless of create date
+            # Cohort: events whose date lies within selected month
             mask_evt_month = ev.between(m_start, m_end)
             gdf = df_work.loc[mask_evt_month, group_cols].copy()
 
@@ -1019,7 +1058,7 @@ def ta_count_table(
     return result.reset_index(drop=True)
 
 if view == "Trend & Analysis":
-    st.subheader("Trend & Analysis – Grouped Drilldowns (Corrected)")
+    st.subheader("Trend & Analysis – Grouped Drilldowns (Corrected + Future Calibration)")
 
     # Group-by fields (multi)
     available_groups = []
@@ -1034,7 +1073,7 @@ if view == "Trend & Analysis":
     # Mode toggle
     level = st.radio("Mode", ["MTD", "Cohort"], index=0, horizontal=True)
 
-    # ---- NEW: Month scope selector (This month / Last month / Custom single-month range) ----
+    # Month scope selector (This month / Last month / Custom single-month range)
     date_mode = st.radio(
         "Date scope",
         ["This month", "Last month", "Custom date range"],
@@ -1044,11 +1083,15 @@ if view == "Trend & Analysis":
 
     if date_mode == "This month":
         month_pick = today
-        st.caption(f"Using **this month**: {today.strftime('%b %Y')}")
+        scope_start, scope_end = month_bounds(today)
+        cutoff_date = scope_end
+        st.caption(f"Using **this month**: {today.strftime('%b %Y')} (cutoff = {cutoff_date})")
     elif date_mode == "Last month":
         lm_start, lm_end = last_month_bounds(today)
         month_pick = lm_start
-        st.caption(f"Using **last month**: {lm_start.strftime('%b %Y')}")
+        scope_start, scope_end = lm_start, lm_end
+        cutoff_date = scope_end
+        st.caption(f"Using **last month**: {lm_start.strftime('%b %Y')} (cutoff = {cutoff_date})")
     else:
         col_d1, col_d2 = st.columns(2)
         with col_d1:
@@ -1061,35 +1104,47 @@ if view == "Trend & Analysis":
             st.error("End date cannot be before start date.")
             st.stop()
 
-        # Keep TA logic unchanged by enforcing single-month custom range
+        # Keep TA logic to single-month
         if (custom_start.year, custom_start.month) != (custom_end.year, custom_end.month):
             st.error("Pick a custom range within a single calendar month.")
             st.stop()
 
         month_pick = custom_start
-        st.caption(f"Using **custom month**: {custom_start.strftime('%b %Y')} (from {custom_start} to {custom_end})")
+        scope_start, scope_end = custom_start, custom_end
+        cutoff_date = custom_end
+        st.caption(f"Using **custom month**: {custom_start.strftime('%b %Y')} (cutoff = {cutoff_date})")
 
-    # Metric picker
+    # Metric picker (added derived metric)
     all_metrics = [
         "Payment Received Date — Count",
         "First Calibration Scheduled Date — Count",
         "Calibration Rescheduled Date — Count",
         "Calibration Done Date — Count",
         "Create Date (deals) — Count",
+        "Future Calibration Scheduled — Count",   # NEW
     ]
     metrics_selected = st.multiselect("Metrics to show", options=all_metrics, default=all_metrics)
 
-    # Map metric display names to actual columns
+    # Map metric display names to actual columns (derived uses both cal cols via params below)
     metric_cols = {
         "Payment Received Date — Count": pay_col,
         "First Calibration Scheduled Date — Count": first_cal_sched_col,
         "Calibration Rescheduled Date — Count": cal_resched_col,
         "Calibration Done Date — Count": cal_done_col,
         "Create Date (deals) — Count": create_col,
+        "Future Calibration Scheduled — Count": None,  # handled separately
     }
 
-    # Warnings for missing columns (only for metrics the user selected)
-    miss = [m for m in metrics_selected if (m != "Create Date (deals) — Count" and (metric_cols.get(m) is None or metric_cols.get(m) not in df_f.columns))]
+    # Warnings for missing columns (selected)
+    miss = []
+    for m in metrics_selected:
+        if m == "Future Calibration Scheduled — Count":
+            if (first_cal_sched_col is None or first_cal_sched_col not in df_f.columns) and \
+               (cal_resched_col is None or cal_resched_col not in df_f.columns):
+                miss.append("Future Calibration Scheduled (needs First and/or Rescheduled)")
+        elif m != "Create Date (deals) — Count":
+            if (metric_cols.get(m) is None) or (metric_cols.get(m) not in df_f.columns):
+                miss.append(m)
     if miss:
         st.warning("Missing columns for: " + ", ".join(miss) + ". Those counts will show as 0.", icon="⚠️")
 
@@ -1102,6 +1157,9 @@ if view == "Trend & Analysis":
         create_col=create_col,
         metric_cols=metric_cols,
         metrics_selected=metrics_selected,
+        cutoff_date=scope_end,
+        first_cal_col=first_cal_sched_col,
+        cal_resched_col=cal_resched_col,
     )
 
     st.markdown("### Output")
