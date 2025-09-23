@@ -1,5 +1,5 @@
 # app_8020.py
-# JetLearn: 80-20 Pareto + Trajectory + Conversion% + Interactive Mix Analyzer
+# JetLearn: 80-20 Pareto + Trajectory + Conversion% + Interactive Mix Analyzer (with Month-wise view)
 # Reads Master_sheet-DB.csv from the same folder.
 
 import streamlit as st
@@ -235,7 +235,6 @@ def conversion_stats(df_all: pd.DataFrame, start_d: date, end_d: date, mode: str
     num_overall = int(num_mask.sum())
     pct_overall = (num_overall/den_overall*100.0) if den_overall > 0 else 0.0
 
-    # By key source
     rows = []
     for src in ["Referral", "PM - Search", "PM - Social"]:
         src_mask = (d["_key_source"] == src)
@@ -378,7 +377,7 @@ else:
 # ----------------------------
 st.markdown("### Interactive Mix Analyzer — % of overall business from your selection")
 
-col_im1, col_im2, col_im3 = st.columns([1.2, 1, 1])
+col_im1, col_im2, col_im3 = st.columns([1.3, 1, 1])
 with col_im1:
     use_key_sources = st.checkbox(
         "Use key-source mapping (Referral / PM - Search / PM - Social)",
@@ -424,6 +423,15 @@ else:
     picked_countries = []
     st.info("Country column not found, country filtering disabled for Mix Analyzer.")
 
+# ---- NEW: Month-wise view toggle
+mix_view = st.radio(
+    "Mix view",
+    ["Aggregate (range total)", "Month-wise"],
+    index=0,
+    horizontal=True,
+    help="Aggregate = single % for whole range. Month-wise = monthly % time series."
+)
+
 # Compute % of overall
 total_payments = int(len(cohort_now))
 
@@ -436,41 +444,126 @@ else:
     if picked_countries and country_col:
         sel_mask &= cohort_now[country_col].astype(str).isin(picked_countries)
 
-    selected_payments = int(sel_mask.sum())
-    pct_of_overall = (selected_payments / total_payments * 100.0) if total_payments > 0 else 0.0
+    if mix_view == "Aggregate (range total)":
+        # ----- Aggregate KPI -----
+        selected_payments = int(sel_mask.sum())
+        pct_of_overall = (selected_payments / total_payments * 100.0) if total_payments > 0 else 0.0
 
-    # KPI
-    st.markdown(
-        f"<div class='kpi-card'>"
-        f"<div class='kpi-title'>Contribution of your selection ({start_d} → {end_d})</div>"
-        f"<div class='kpi-value'>{pct_of_overall:.1f}%</div>"
-        f"<div class='kpi-sub'>Enrolments in selection: {selected_payments:,} • Total: {total_payments:,}</div>"
-        f"</div>",
-        unsafe_allow_html=True,
-    )
+        st.markdown(
+            f"<div class='kpi-card'>"
+            f"<div class='kpi-title'>Contribution of your selection ({start_d} → {end_d})</div>"
+            f"<div class='kpi-value'>{pct_of_overall:.1f}%</div>"
+            f"<div class='kpi-sub'>Enrolments in selection: {selected_payments:,} • Total: {total_payments:,}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
-    # Bar: selection breakdown by source as % of overall
-    breakdown = (
-        cohort_now.loc[sel_mask]
-        .groupby("_src_pick").size().rename("SelCnt").reset_index()
-        if source_col else pd.DataFrame(columns=["_src_pick","SelCnt"])
-    )
-    if not breakdown.empty:
-        breakdown["PctOfOverall"] = breakdown["SelCnt"] / total_payments * 100.0
-        breakdown = breakdown.sort_values("PctOfOverall", ascending=False)
-        chart = alt.Chart(breakdown).mark_bar(opacity=0.9).encode(
-            x=alt.X("_src_pick:N", title="Source"),
-            y=alt.Y("PctOfOverall:Q", title="% of overall business"),
+        # Bar: selection breakdown by source as % of overall
+        breakdown = (
+            cohort_now.loc[sel_mask]
+            .groupby("_src_pick").size().rename("SelCnt").reset_index()
+            if source_col else pd.DataFrame(columns=["_src_pick","SelCnt"])
+        )
+        if not breakdown.empty:
+            breakdown["PctOfOverall"] = breakdown["SelCnt"] / total_payments * 100.0
+            breakdown = breakdown.sort_values("PctOfOverall", ascending=False)
+            chart = alt.Chart(breakdown).mark_bar(opacity=0.9).encode(
+                x=alt.X("_src_pick:N", title="Source"),
+                y=alt.Y("PctOfOverall:Q", title="% of overall business"),
+                tooltip=[
+                    alt.Tooltip("_src_pick:N", title="Source"),
+                    alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
+                    alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f"),
+                ],
+                color=alt.Color("_src_pick:N", legend=alt.Legend(orient="bottom"))
+            ).properties(height=320, title="Selection breakdown by source — % of overall")
+            st.altair_chart(chart, use_container_width=True)
+
+    else:
+        # ----- Month-wise KPI + charts -----
+        cohort_now["_pay_m"] = cohort_now["_pay_dt"].dt.to_period("M")
+        months_in_range = (
+            cohort_now["_pay_m"].dropna().sort_values().unique().astype(str).tolist()
+        )
+
+        # Overall totals per month
+        overall_m = cohort_now.groupby("_pay_m").size().rename("TotalAll").reset_index()
+        overall_m["_pay_m_str"] = overall_m["_pay_m"].astype(str)
+
+        # Selected counts per month (all chosen sources/countries)
+        sel_m = cohort_now.loc[sel_mask].groupby("_pay_m").size().rename("SelCnt").reset_index()
+        sel_m["_pay_m_str"] = sel_m["_pay_m"].astype(str)
+
+        mix = overall_m.merge(sel_m[["_pay_m","SelCnt","_pay_m_str"]], on=["_pay_m","_pay_m_str"], how="left").fillna({"SelCnt":0})
+        mix["PctOfOverall"] = np.where(mix["TotalAll"]>0, mix["SelCnt"]/mix["TotalAll"]*100.0, 0.0)
+        mix["_pay_m_str"] = pd.Categorical(mix["_pay_m_str"], categories=months_in_range, ordered=True)
+
+        # KPI: average monthly contribution across months (simple mean of monthly %)
+        avg_monthly_pct = mix["PctOfOverall"].mean() if len(mix) > 0 else 0.0
+        st.markdown(
+            f"<div class='kpi-card'>"
+            f"<div class='kpi-title'>Month-wise: average % contribution</div>"
+            f"<div class='kpi-value'>{avg_monthly_pct:.1f}%</div>"
+            f"<div class='kpi-sub'>Months: {len(mix)}</div>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        # Line: selection % of overall by month
+        line = alt.Chart(mix).mark_line(point=True).encode(
+            x=alt.X("_pay_m_str:N", title="Month", sort=months_in_range),
+            y=alt.Y("PctOfOverall:Q", title="% of overall business", scale=alt.Scale(domain=[0, 100])),
             tooltip=[
-                alt.Tooltip("_src_pick:N", title="Source"),
+                alt.Tooltip("_pay_m_str:N", title="Month"),
                 alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
+                alt.Tooltip("TotalAll:Q", title="Total enrolments"),
                 alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f"),
-            ],
-            color=alt.Color("_src_pick:N", legend=alt.Legend(orient="bottom"))
-        ).properties(height=320, title="Selection breakdown by source — % of overall")
-        st.altair_chart(chart, use_container_width=True)
+            ]
+        ).properties(height=320, title="Your selection — % of overall business by month")
+        st.altair_chart(line, use_container_width=True)
 
-    # Detail table + download
+        # Optional: stacked bars by source per month as % of overall
+        show_source_breakdown = st.checkbox(
+            "Show month-wise source breakdown (stacked bars, % of overall)", value=False
+        )
+        if show_source_breakdown and source_col:
+            # Per month, per source within selection
+            sel_src_m = (
+                cohort_now.loc[sel_mask]
+                .groupby(["_pay_m","_src_pick"]).size().rename("SelCnt").reset_index()
+            )
+            sel_src_m = sel_src_m.merge(overall_m[["_pay_m","TotalAll"]], on="_pay_m", how="left")
+            sel_src_m["PctOfOverall"] = np.where(sel_src_m["TotalAll"]>0, sel_src_m["SelCnt"]/sel_src_m["TotalAll"]*100.0, 0.0)
+            sel_src_m["_pay_m_str"] = sel_src_m["_pay_m"].astype(str)
+            sel_src_m["_pay_m_str"] = pd.Categorical(sel_src_m["_pay_m_str"], categories=months_in_range, ordered=True)
+
+            bars = alt.Chart(sel_src_m).mark_bar(opacity=0.9).encode(
+                x=alt.X("_pay_m_str:N", title="Month", sort=months_in_range),
+                y=alt.Y("PctOfOverall:Q", title="% of overall (stacked)"),
+                color=alt.Color("_src_pick:N", legend=alt.Legend(orient="bottom"), title="Source"),
+                tooltip=[
+                    alt.Tooltip("_pay_m_str:N", title="Month"),
+                    alt.Tooltip("_src_pick:N", title="Source"),
+                    alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
+                    alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f"),
+                ]
+            ).properties(height=320, title="Selection — month-wise source breakdown (% of overall)")
+            st.altair_chart(bars, use_container_width=True)
+
+        # Month-wise table + download
+        with st.expander("Download: Month-wise selection contribution"):
+            view = mix[["_pay_m_str","SelCnt","TotalAll","PctOfOverall"]].rename(
+                columns={"_pay_m_str":"Month","SelCnt":"Selected Enrolments","TotalAll":"Total Enrolments","PctOfOverall":"% of Overall"}
+            ).sort_values("Month")
+            st.dataframe(view, use_container_width=True)
+            st.download_button(
+                "Download CSV – Month-wise selection",
+                data=view.to_csv(index=False).encode("utf-8"),
+                file_name="mix_selection_monthwise.csv",
+                mime="text/csv"
+            )
+
+    # Detail table + download (aggregate mode always available)
     with st.expander("Selected rows (cohort subset)"):
         show_cols = []
         if source_col: show_cols.append(source_col)
