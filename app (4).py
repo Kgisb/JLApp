@@ -1,7 +1,8 @@
 # app_8020.py
 # JetLearn: 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer
-# Includes: Month-wise multi-line (per picked source) + NEW stacked bar (Deals Created vs Enrolments)
-# Reads Master_sheet-DB.csv from the same folder.
+# This version restores the previously working app and adds a simple KPI:
+# Deals Created (Create Date count), Enrolments (Payment Received count),
+# and Conversion% = Enrolments / Deals Created for the selected date range.
 
 import streamlit as st
 import pandas as pd
@@ -196,17 +197,15 @@ if source_col:
 else:
     picked_sources = None
 
-# Conversion mode toggle
+# Conversion mode toggle (kept for other visuals; KPI below ignores this toggle as requested)
 st.sidebar.header("Conversion%")
 conv_mode = st.sidebar.radio(
     "Mode", ["MTD", "Cohort"], index=0, horizontal=True,
-    help="MTD: Payments in range that belong to deals created in range.\n"
-         "Cohort: Payments in range (ignore Create Date).\n"
-         "Denominator for both = deals created in range."
+    help="This toggle affects other views where relevant. The KPI below always uses Enrolments (payments in range) / Deals Created (in range)."
 )
 
 # ----------------------------
-# Apply cohort filter (payments within start_d..end_d)
+# Apply cohort filter (payments within start_d..end_d) for charts that need it
 # ----------------------------
 scope_mask = df_clean["_pay_dt"].dt.date.between(start_d, end_d)
 df_cohort = df_clean.loc[scope_mask].copy()
@@ -214,42 +213,29 @@ if picked_sources is not None and source_col:
     df_cohort = df_cohort[df_cohort[source_col].astype(str).isin(picked_sources)]
 
 # ----------------------------
-# Conversion% calculations
+# NEW SIMPLE KPI: Deals Created, Enrolments, Conversion% (range-based)
 # ----------------------------
-def conversion_stats(df_all: pd.DataFrame, start_d: date, end_d: date, mode: str):
-    if create_col is None or pay_col is None:
-        return {"Den": 0, "Num": 0, "Pct": 0.0}, pd.DataFrame(columns=["KeySource","Den","Num","Pct"])
+# Denominator: created in selected date range
+in_create_window = df_clean["_create_dt"].dt.date.between(start_d, end_d)
+deals_created = int(in_create_window.sum())
 
-    d = df_all.copy()
-    d["_cdate"] = d["_create_dt"].dt.date
-    d["_pdate"] = d["_pay_dt"].dt.date
-    d["_key_source"] = d[source_col].apply(normalize_key_source) if source_col else "Other"
+# Numerator: payments received in selected date range
+in_pay_window = df_clean["_pay_dt"].dt.date.between(start_d, end_d)
+enrolments = int(in_pay_window.sum())
 
-    denom_mask = d["_cdate"].between(start_d, end_d)
-    den_overall = int(denom_mask.sum())
+conv_pct_simple = (enrolments / deals_created * 100.0) if deals_created > 0 else 0.0
 
-    if mode == "MTD":
-        num_mask = d["_pdate"].between(start_d, end_d) & denom_mask
-    else:
-        num_mask = d["_pdate"].between(start_d, end_d)
-
-    num_overall = int(num_mask.sum())
-    pct_overall = (num_overall/den_overall*100.0) if den_overall > 0 else 0.0
-
-    rows = []
-    for src in ["Referral", "PM - Search", "PM - Social"]:
-        src_mask = (d["_key_source"] == src)
-        den = int((denom_mask & src_mask).sum())
-        num = int((num_mask & src_mask).sum())
-        pct = (num/den*100.0) if den > 0 else 0.0
-        rows.append({"KeySource": src, "Den": den, "Num": num, "Pct": pct})
-    by_src = pd.DataFrame(rows)
-    return {"Den": den_overall, "Num": num_overall, "Pct": pct_overall}, by_src
-
-overall_conv, bysrc_conv = conversion_stats(df_clean, start_d, end_d, conv_mode)
+st.markdown("<div class='section-title'>Range KPI — Deals Created vs Enrolments</div>", unsafe_allow_html=True)
+cA, cB, cC = st.columns(3)
+with cA:
+    st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Deals Created</div><div class='kpi-value'>{deals_created:,}</div><div class='kpi-sub'>{start_d} → {end_d}</div></div>", unsafe_allow_html=True)
+with cB:
+    st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Enrolments (Payments)</div><div class='kpi-value'>{enrolments:,}</div><div class='kpi-sub'>{start_d} → {end_d}</div></div>", unsafe_allow_html=True)
+with cC:
+    st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Conversion% (Payments / Created)</div><div class='kpi-value'>{conv_pct_simple:.1f}%</div><div class='kpi-sub'>Num: {enrolments:,} • Den: {deals_created:,}</div></div>", unsafe_allow_html=True)
 
 # ----------------------------
-# KPIs
+# Existing KPIs based on cohort subset (for context)
 # ----------------------------
 st.markdown("<div class='section-title'>Cohort KPIs</div>", unsafe_allow_html=True)
 total_enr = int(len(df_cohort))
@@ -264,12 +250,11 @@ cty_tbl = build_pareto(df_cohort, country_col, "Country") if total_enr > 0 else 
 n_sources_80 = int((src_tbl["CumPct"] <= 80).sum()) if not src_tbl.empty else 0
 n_countries_80 = int((cty_tbl["CumPct"] <= 80).sum()) if not cty_tbl.empty else 0
 
-k1, k2, k3, k4, k5 = st.columns(5)
-with k1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Enrollments</div><div class='kpi-value'>{total_enr:,}</div><div class='kpi-sub'>{start_d} → {end_d}</div></div>", unsafe_allow_html=True)
-with k2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Referral %</div><div class='kpi-value'>{ref_pct:.1f}%</div><div class='kpi-sub'>{ref_cnt:,} of {total_enr:,}</div></div>", unsafe_allow_html=True)
+k1, k2, k3, k4 = st.columns(4)
+with k1: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Cohort Enrolments</div><div class='kpi-value'>{total_enr:,}</div><div class='kpi-sub'>{start_d} → {end_d}</div></div>", unsafe_allow_html=True)
+with k2: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Referral % (cohort)</div><div class='kpi-value'>{ref_pct:.1f}%</div><div class='kpi-sub'>{ref_cnt:,} of {total_enr:,}</div></div>", unsafe_allow_html=True)
 with k3: st.markdown(f"<div class='kpi-card'><div class='kpi-title'># Sources for 80%</div><div class='kpi-value'>{n_sources_80}</div></div>", unsafe_allow_html=True)
 with k4: st.markdown(f"<div class='kpi-card'><div class='kpi-title'># Countries for 80%</div><div class='kpi-value'>{n_countries_80}</div></div>", unsafe_allow_html=True)
-with k5: st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Conversion% ({conv_mode})</div><div class='kpi-value'>{overall_conv['Pct']:.1f}%</div><div class='kpi-sub'>Num: {overall_conv['Num']:,} • Den: {overall_conv['Den']:,}</div></div>", unsafe_allow_html=True)
 
 # ----------------------------
 # 80-20 Charts
@@ -282,14 +267,35 @@ st.altair_chart(pareto_chart(cty_tbl, "Country", "Pareto – Enrolments by Count
 # ----------------------------
 # Conversion% by Key Source (bar)
 # ----------------------------
-st.markdown("### Conversion% by Key Source")
+def conversion_stats(df_all: pd.DataFrame, start_d: date, end_d: date):
+    if create_col is None or pay_col is None:
+        return pd.DataFrame(columns=["KeySource","Den","Num","Pct"])
+    d = df_all.copy()
+    d["_cdate"] = d["_create_dt"].dt.date
+    d["_pdate"] = d["_pay_dt"].dt.date
+    d["_key_source"] = d[source_col].apply(normalize_key_source) if source_col else "Other"
+
+    denom_mask = d["_cdate"].between(start_d, end_d)  # deals created within range
+    num_mask = d["_pdate"].between(start_d, end_d)    # payments within range
+
+    rows = []
+    for src in ["Referral", "PM - Search", "PM - Social"]:
+        src_mask = (d["_key_source"] == src)
+        den = int((denom_mask & src_mask).sum())
+        num = int((num_mask & src_mask).sum())
+        pct = (num/den*100.0) if den > 0 else 0.0
+        rows.append({"KeySource": src, "Den": den, "Num": num, "Pct": pct})
+    return pd.DataFrame(rows)
+
+st.markdown("### Conversion% by Key Source (range-based)")
+bysrc_conv = conversion_stats(df_clean, start_d, end_d)
 if not bysrc_conv.empty:
     conv_chart = alt.Chart(bysrc_conv).mark_bar(opacity=0.9).encode(
         x=alt.X("KeySource:N", sort=["Referral","PM - Search","PM - Social"], title="Source"),
         y=alt.Y("Pct:Q", title="Conversion%"),
-        tooltip=[alt.Tooltip("KeySource:N"), alt.Tooltip("Den:Q", title="Deals (Den)"),
-                 alt.Tooltip("Num:Q", title="Enrolments (Num)"), alt.Tooltip("Pct:Q", title="Conversion%", format=".1f")]
-    ).properties(height=300, title=f"Conversion% ({conv_mode}) • Den = Create Date in range • Num = Payments in range")
+        tooltip=[alt.Tooltip("KeySource:N"), alt.Tooltip("Den:Q", title="Deals (Created)"),
+                 alt.Tooltip("Num:Q", title="Enrolments (Payments)"), alt.Tooltip("Pct:Q", title="Conversion%", format=".1f")]
+    ).properties(height=300, title=f"Conversion% (Payments / Created) • {start_d} → {end_d}")
     st.altair_chart(conv_chart, use_container_width=True)
 else:
     st.info("No data to compute Conversion% by key source for this window.")
@@ -580,147 +586,6 @@ else:
                 file_name="mix_selection_monthwise_lines.csv",
                 mime="text/csv"
             )
-
-# ============================
-# NEW — Stacked Conversion Bar (Deals Created vs Enrolments)
-# ============================
-st.markdown("### Stacked Conversion Bar — Deals Created vs Enrolments")
-
-# Ensure df_clean has normalized _src_pick too (used for filters here)
-if source_col:
-    if use_key_sources:
-        df_clean["_src_pick"] = df_clean[source_col].apply(normalize_key_source)
-    else:
-        df_clean["_src_pick"] = df_clean[source_col].fillna("Unknown").astype(str)
-
-# Masks by window and picks (apply to df_clean)
-in_pay_window = df_clean["_pay_dt"].dt.date.between(start_d, end_d)
-in_create_window = df_clean["_create_dt"].dt.date.between(start_d, end_d)
-
-base_mask_conv = pd.Series(True, index=df_clean.index)
-if source_col and picked_sources is not None and len(picked_sources) > 0:
-    # For consistency with Mix Analyzer, if user picked only certain sources in sidebar Pareto,
-    # we'll still let the stacked bar respect the *Mix* selections (picked_srcs) if available.
-    # But if user cleared Mix selections, fall back to sidebar picks.
-    pass  # sidebar picks influence Pareto earlier; for the stacked bar we read Mix picks below.
-
-# Respect Mix picks (picked_srcs/picked_countries) if any
-if source_col and 'picked_srcs' in locals() and picked_srcs:
-    base_mask_conv &= df_clean["_src_pick"].isin(picked_srcs)
-if country_col and 'picked_countries' in locals() and picked_countries:
-    base_mask_conv &= df_clean[country_col].astype(str).isin(picked_countries)
-
-# Prepare month fields
-df_clean["_create_m"] = df_clean["_create_dt"].dt.to_period("M")
-df_clean["_pay_m"]    = df_clean["_pay_dt"].dt.to_period("M")
-
-gran = st.radio(
-    "Granularity (stacked bar)",
-    ["Month-wise", "Aggregate (single bar)"],
-    horizontal=True,
-    index=0
-)
-
-def nonneg(x):
-    try:
-        return max(0, int(x))
-    except Exception:
-        return 0
-
-if gran == "Aggregate (single bar)":
-    # Denominator = deals created in window (under filters)
-    den_mask = base_mask_conv & in_create_window
-    den_total = int(den_mask.sum())
-
-    if conv_mode == "MTD":
-        # Numerator = payments in window, among those created in window
-        num_mask = base_mask_conv & in_pay_window & in_create_window
-    else:  # Cohort
-        # Numerator = payments in window (ignore create alignment)
-        num_mask = base_mask_conv & in_pay_window
-
-    num_total = int(num_mask.sum())
-    rem_total = nonneg(den_total - num_total)
-
-    agg_df = pd.DataFrame({
-        "Bucket": ["Enrolments (Payments)", "Remaining"],
-        "Count": [num_total, rem_total]
-    })
-
-    agg_chart = alt.Chart(agg_df).mark_bar().encode(
-        x=alt.X("Count:Q", title="Count"),
-        y=alt.Y("Bucket:N", title=None),
-        color=alt.Color("Bucket:N", legend=alt.Legend(orient="bottom")),
-        tooltip=[alt.Tooltip("Bucket:N"), alt.Tooltip("Count:Q")]
-    ).properties(height=120, title=f"Aggregate • Deals Created = {den_total:,} (bar total)")
-    st.altair_chart(agg_chart, use_container_width=True)
-
-else:
-    # Month-wise — build month axis from window
-    months_all = pd.period_range(start=pd.Period(start_d, freq="M"),
-                                 end=pd.Period(end_d,   freq="M"),
-                                 freq="M")
-    months_lbl = [str(p) for p in months_all]
-
-    # Denominator by Create Month (always)
-    den_month = (
-        df_clean.loc[base_mask_conv & in_create_window]
-                .groupby("_create_m").size().rename("Created")
-                .reindex(months_all, fill_value=0)
-                .reset_index().rename(columns={"_create_m":"MonthP"})
-    )
-
-    # Numerator by month depends on mode
-    if conv_mode == "MTD":
-        # Payments counted only for deals created in the same month
-        paid_same_month = (
-            df_clean.loc[base_mask_conv & in_create_window & in_pay_window & (df_clean["_create_m"] == df_clean["_pay_m"])]
-                    .groupby("_create_m").size().rename("Enrolled")
-                    .reindex(months_all, fill_value=0).reset_index().rename(columns={"_create_m":"MonthP"})
-        )
-    else:
-        # Cohort: Payments counted by Payment Month (ignoring create)
-        paid_same_month = (
-            df_clean.loc[base_mask_conv & in_pay_window]
-                    .groupby("_pay_m").size().rename("Enrolled")
-                    .reindex(months_all, fill_value=0).reset_index().rename(columns={"_pay_m":"MonthP"})
-        )
-
-    merged = den_month.merge(paid_same_month, on="MonthP", how="left").fillna({"Enrolled":0})
-    merged["Month"] = merged["MonthP"].astype(str)
-    merged["Remaining"] = (merged["Created"] - merged["Enrolled"]).clip(lower=0)
-
-    # Melt to stacked format
-    stack_df = merged.melt(
-        id_vars=["Month","Created"],
-        value_vars=["Enrolled","Remaining"],
-        var_name="Bucket",
-        value_name="Count"
-    )
-    stack_df["Month"] = pd.Categorical(stack_df["Month"], categories=months_lbl, ordered=True)
-
-    # Stacked bars (Enrolled at bottom)
-    stacked = alt.Chart(stack_df).mark_bar().encode(
-        x=alt.X("Month:N", sort=months_lbl, title="Month"),
-        y=alt.Y("Count:Q", title="Count"),
-        color=alt.Color("Bucket:N", sort=["Enrolled","Remaining"], legend=alt.Legend(orient="bottom")),
-        order=alt.Order("Bucket", sort=["Enrolled","Remaining"]),
-        tooltip=[
-            alt.Tooltip("Month:N"),
-            alt.Tooltip("Bucket:N"),
-            alt.Tooltip("Count:Q"),
-        ]
-    ).properties(height=320, title="Month-wise • Bar total = Deals Created; bottom = Enrolments")
-
-    # Optional total labels (created)
-    labels = alt.Chart(merged).mark_text(dy=-6).encode(
-        x=alt.X("Month:N", sort=months_lbl),
-        y=alt.Y("Created:Q"),
-        text=alt.Text("Created:Q"),
-        tooltip=[alt.Tooltip("Created:Q", title="Deals Created")]
-    )
-
-    st.altair_chart(stacked + labels, use_container_width=True)
 
 # ----------------------------
 # Tables + Downloads
