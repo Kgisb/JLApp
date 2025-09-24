@@ -245,6 +245,7 @@ def prep_options(series: pd.Series):
     return ["All"] + vals
 
 with st.expander("Filters (apply to MIS / Predictibility / Trend & Analysis)", expanded=False):
+    
     if counsellor_col:
         sel_counsellors = st.multiselect("Academic Counsellor", options=prep_options(df[counsellor_col]), default=["All"])
     else:
