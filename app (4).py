@@ -1316,11 +1316,10 @@ elif view == "80-20":
     monthly_total = df_trail.groupby("_pay_m").size().rename("TotalAll").reset_index()
 
     if top_countries and source_col and country_col:
-    mcs = (
+        mcs = (
         df_trail_src[df_trail_src[country_col].astype(str).isin(top_countries)]
         .groupby(["_pay_m", country_col, "_traj_source"]).size().rename("Cnt").reset_index()
     )
-
     else:
         mcs = pd.DataFrame(columns=["_pay_m", country_col if country_col else "Country", "_traj_source", "Cnt"])
 
