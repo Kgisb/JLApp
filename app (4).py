@@ -2183,4 +2183,3 @@ elif view == "Stuck deals":
                 file_name="stuck_deals_mom_funnel_propagation.csv",
                 mime="text/csv"
             )
-
