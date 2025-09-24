@@ -1139,6 +1139,16 @@ elif view == "80-20":
     df80["_create_dt"] = coerce_datetime(df80[create_col])
     df80["_pay_m"] = df80["_pay_dt"].dt.to_period("M")
 
+    # ✅ Apply Track filter to 80-20 too
+    if track != "Both":
+        if pipeline_col and pipeline_col in df80.columns:
+            _norm80 = df80[pipeline_col].map(normalize_pipeline).fillna("Other")
+            before_ct = len(df80)
+            df80 = df80.loc[_norm80 == track].copy()
+            st.caption(f"80-20 scope after Track filter ({track}): **{len(df80):,}** rows (was {before_ct:,}).")
+        else:
+            st.warning("Pipeline column not found — the Track filter can’t be applied in 80-20.", icon="⚠️")
+
     if source_col:
         df80["_src_raw"] = df80[source_col].fillna("Unknown").astype(str)
     else:
