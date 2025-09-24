@@ -3,7 +3,7 @@
 # Adds:
 # 1) Range KPI for Created/Enrolments/Conversion
 # 2) Interactive Mix Analyzer (existing)
-# 3) Deals vs Enrolments for your selection (+ optional Conversion% line)
+# 3) Deals vs Enrolments for your selection (bars = Enrolments only, optional Conversion% line)
 
 import streamlit as st
 import pandas as pd
@@ -214,7 +214,7 @@ if picked_sources is not None and source_col:
     df_cohort = df_cohort[df_cohort[source_col].astype(str).isin(picked_sources)]
 
 # ----------------------------
-# NEW SIMPLE KPI: Deals Created, Enrolments, Conversion% (range-based)
+# Range KPI: Deals Created, Enrolments, Conversion% (range-based)
 # ----------------------------
 in_create_window = df_clean["_create_dt"].dt.date.between(start_d, end_d)
 deals_created = int(in_create_window.sum())
@@ -587,7 +587,7 @@ else:
             )
 
 # =========================
-# Deals vs Enrolments — for your current selection (+ optional Conversion% line)
+# Deals vs Enrolments — for your current selection (bars = Enrolments only)
 # =========================
 st.markdown("### Deals vs Enrolments — for your current selection")
 
@@ -694,24 +694,19 @@ with kpc:
         f"<div class='kpi-sub'>Num: {int(agg_sel['PaidCnt'].iloc[0]):,} • Den: {int(agg_sel['CreatedCnt'].iloc[0]):,}</div></div>",
         unsafe_allow_html=True)
 
-# Month-wise combined chart (bars + optional conversion line)
-show_conv_line = st.checkbox("Overlay Conversion% line on month-wise chart", value=True, key="mix_conv_line")
+# ---- Month-wise chart: Bars = Enrolments only (+ optional Conversion% line)
+show_conv_line = st.checkbox("Overlay Conversion% line on enrolments chart", value=True, key="mix_conv_line")
 
 if not monthly_sel.empty:
-    bar_df = monthly_sel.melt(id_vars=["Month"], value_vars=["CreatedCnt", "PaidCnt"],
-                              var_name="Metric", value_name="Count")
-    bar_df["Metric"] = bar_df["Metric"].map({"CreatedCnt": "Deals Created", "PaidCnt": "Enrolments"})
-
-    bars = alt.Chart(bar_df).mark_bar(opacity=0.9).encode(
+    # Bars: Enrolments only
+    bars = alt.Chart(monthly_sel).mark_bar(opacity=0.9).encode(
         x=alt.X("Month:N", sort=monthly_sel["Month"].tolist(), title="Month"),
-        y=alt.Y("Count:Q", title="Count"),
-        color=alt.Color("Metric:N", title=""),
+        y=alt.Y("PaidCnt:Q", title="Enrolments"),
         tooltip=[
             alt.Tooltip("Month:N"),
-            alt.Tooltip("Metric:N"),
-            alt.Tooltip("Count:Q")
+            alt.Tooltip("PaidCnt:Q", title="Enrolments")
         ]
-    ).properties(height=360, title="Month-wise — Deals vs Enrolments (for your current selection)")
+    ).properties(height=360, title="Month-wise — Enrolments (bars)")
 
     if show_conv_line:
         line = alt.Chart(monthly_sel).mark_line(point=True).encode(
