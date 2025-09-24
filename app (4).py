@@ -2,8 +2,8 @@
 # JetLearn: 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer
 # NEW: Per-source country filters with All/None/Specific in the Interactive Mix Analyzer.
 #      Each selected source gets its own country selector; downstream visuals use the OR-union.
-# NEW (this update): In Trajectory, pick a JetLearn Deal Source (All / Referral / PM-Search / PM-Social).
-#      Top countries are computed by cohort enrolments for the chosen source and visuals update accordingly.
+# NEW (earlier): In Trajectory, pick a Deal Source basis (All / selected) to choose Top Countries.
+# NEW (this update): Trajectory supports ALL JetLearn deal sources (raw) or the key 3 buckets via a toggle.
 
 import streamlit as st
 import pandas as pd
@@ -312,99 +312,119 @@ else:
     st.info("No data to compute Conversion% by key source for this window.")
 
 # ----------------------------
-# Trajectory – Top Countries × (Referral, PM - Search, PM - Social)
+# Trajectory – Top Countries × (Key or Raw Deal Sources)
 # ----------------------------
-st.markdown("### Trajectory – Top Countries × Referral / PM - Search / PM - Social")
+st.markdown("### Trajectory – Top Countries × Referral / PM - Search / PM - Social (or All Raw Sources)")
 
-col_t1, col_t2, col_t3 = st.columns([1, 1, 1.2])
+col_t1, col_t2, col_tg, col_t3 = st.columns([1, 1, 1.4, 1.6])
 with col_t1:
     trailing_k = st.selectbox("Trailing window (months)", [3, 6, 12], index=0,
                               help="Monthly trajectory ends at your selected end date.")
 with col_t2:
     top_k = st.selectbox("Top countries (by cohort enrolments)", [5, 7], index=0)
-with col_t3:
-    # NEW: Choose which deal source to use for picking top countries & building trajectory
-    traj_src_pick = st.selectbox(
-        "Deal Source for Top Countries",
-        options=["All sources", "Referral", "PM - Search", "PM - Social"],
-        index=0,
-        help="Top countries and charts will be computed from payments of this source (or all sources) in the trailing window."
+with col_tg:
+    # NEW: Grouping for this Trajectory section only
+    traj_grouping = st.radio(
+        "Source grouping",
+        ["Key (Referral/PM-Search/PM-Social/Other)", "Raw (all)"],
+        index=0, horizontal=False,
+        help="Choose how to display sources in Trajectory: 3 key buckets or all raw sources."
     )
 
+# Build trailing cohort
 months_list = months_back_list(end_d, trailing_k)
 months_str = [str(p) for p in months_list]
 
 df_trail = df_clean[df_clean["_pay_m"].isin(months_list)].copy()
-df_trail["_key_source"] = df_trail[source_col].apply(normalize_key_source) if source_col else "Other"
 
-# ---- NEW: Filter the trailing cohort by chosen source when picking top countries & building series
+# Assign trajectory source label based on grouping
+if traj_grouping.startswith("Key"):
+    df_trail["_traj_source"] = df_trail[source_col].apply(normalize_key_source) if source_col else "Other"
+    # Options for the "Basis Source" dropdown (used to pick top countries)
+    traj_source_options = ["All sources", "Referral", "PM - Search", "PM - Social", "Other"]
+else:
+    # Raw sources
+    df_trail["_traj_source"] = df_trail[source_col].fillna("Unknown").astype(str) if source_col else "Other"
+    # All unique raw sources present in trailing window
+    unique_raw = sorted(df_trail["_traj_source"].dropna().unique().tolist())
+    traj_source_options = ["All sources"] + unique_raw
+
+with col_t3:
+    traj_src_pick = st.selectbox(
+        "Deal Source for Top Countries",
+        options=traj_source_options,
+        index=0,
+        help="Top countries and charts are computed from payments of this source (or All) in the trailing window."
+    )
+
+# Filter trailing cohort by chosen basis for top-country selection
 if traj_src_pick != "All sources":
-    df_trail_src = df_trail[df_trail["_key_source"] == traj_src_pick].copy()
+    df_trail_src = df_trail[df_trail["_traj_source"] == traj_src_pick].copy()
 else:
     df_trail_src = df_trail.copy()
 
 # Top K countries across trailing window (based on chosen source cohort)
-if country_col:
+if country_col and not df_trail_src.empty:
     cty_counts = df_trail_src.groupby(country_col).size().sort_values(ascending=False)
     top_countries = cty_counts.head(top_k).index.astype(str).tolist()
 else:
     top_countries = []
 
-# Monthly total enrolments (all sources or chosen source?) 
-# For "% of overall business", the denominator should be overall (total payments in that month, across all sources).
+# Monthly total enrolments across ALL sources (denominator for "% of overall business")
 monthly_total = df_trail.groupby("_pay_m").size().rename("TotalAll").reset_index()
 
-# Build (Month, Country, KeySource) counts for the chosen source cohort, restricted to top countries
+# Build Month × Country × TrajSource counts for the chosen source cohort, restricted to top countries
 if top_countries and source_col and country_col:
     mcs = (
         df_trail_src[df_trail_src[country_col].astype(str).isin(top_countries)]
-        .groupby(["_pay_m", country_col, "_key_source"]).size().rename("Cnt").reset_index()
+        .groupby(["_pay_m", country_col, "_traj_source"]).size().rename("Cnt").reset_index()
     )
 else:
-    mcs = pd.DataFrame(columns=["_pay_m", country_col if country_col else "Country", "_key_source", "Cnt"])
+    mcs = pd.DataFrame(columns=["_pay_m", country_col if country_col else "Country", "_traj_source", "Cnt"])
 
 if not mcs.empty:
     mcs = mcs.merge(monthly_total, on="_pay_m", how="left")
     mcs["PctOfOverall"] = np.where(mcs["TotalAll"]>0, mcs["Cnt"]/mcs["TotalAll"]*100.0, 0.0)
-    mcs = mcs[mcs["_key_source"].isin(["Referral", "PM - Search", "PM - Social"])]
     mcs["_pay_m_str"] = pd.Categorical(mcs["_pay_m"].astype(str), categories=months_str, ordered=True)
 
 if not mcs.empty:
-    title_suffix = traj_src_pick if traj_src_pick != "All sources" else "All sources"
+    # Sort color legend by frequency to keep legend stable & useful
+    src_order = mcs["_traj_source"].value_counts().index.tolist()
+    title_suffix = f"{traj_src_pick}" if traj_src_pick != "All sources" else "All sources"
+    grouping_suffix = "Key" if traj_grouping.startswith("Key") else "Raw"
+
     facet_chart = alt.Chart(mcs).mark_bar(opacity=0.9).encode(
         x=alt.X("_pay_m_str:N", title="Month", sort=months_str),
         y=alt.Y("PctOfOverall:Q", title="% of overall business", scale=alt.Scale(domain=[0, 100])),
-        color=alt.Color("_key_source:N", title="Source",
-                        sort=["Referral","PM - Search","PM - Social"]),
+        color=alt.Color("_traj_source:N", title="Source", sort=src_order),
         tooltip=[
             alt.Tooltip("_pay_m_str:N", title="Month"),
             alt.Tooltip(f"{country_col}:N", title="Country") if country_col else alt.Tooltip("_pay_m_str:N"),
-            alt.Tooltip("_key_source:N", title="Source"),
+            alt.Tooltip("_traj_source:N", title="Source"),
             alt.Tooltip("Cnt:Q", title="Count"),
             alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f")
         ]
-    ).properties(height=220, title=f"Top Countries • Source basis: {title_suffix}").facet(
+    ).properties(height=220, title=f"Top Countries • Basis: {title_suffix} • Grouping: {grouping_suffix}").facet(
         column=alt.Column(f"{country_col}:N", title="Top Countries", sort=top_countries)
     )
     st.altair_chart(facet_chart, use_container_width=True)
 
-    # Overall contribution lines (restricted to top countries set)
+    # Overall contribution lines (restricted to the chosen top countries set)
     overall = (
-        mcs.groupby(["_pay_m_str","_key_source"], as_index=False)
+        mcs.groupby(["_pay_m_str","_traj_source"], as_index=False)
            .agg({"Cnt":"sum", "TotalAll":"first"})
     )
     overall["PctOfOverall"] = np.where(overall["TotalAll"]>0, overall["Cnt"]/overall["TotalAll"]*100.0, 0.0)
     lines = alt.Chart(overall).mark_line(point=True).encode(
         x=alt.X("_pay_m_str:N", title="Month", sort=months_str),
         y=alt.Y("PctOfOverall:Q", title="% of overall business (Top countries)", scale=alt.Scale(domain=[0, 100])),
-        color=alt.Color("_key_source:N", title="Source",
-                        sort=["Referral","PM - Search","PM - Social"]),
+        color=alt.Color("_traj_source:N", title="Source", sort=src_order),
         tooltip=[
             alt.Tooltip("_pay_m_str:N", title="Month"),
-            alt.Tooltip("_key_source:N", title="Source"),
+            alt.Tooltip("_traj_source:N", title="Source"),
             alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f")
         ]
-    ).properties(title=f"Overall contribution of key sources (Top countries • Source basis: {title_suffix})", height=320)
+    ).properties(title=f"Overall contribution by source (Top countries • Basis: {title_suffix} • Grouping: {grouping_suffix})", height=320)
     st.altair_chart(lines, use_container_width=True)
 else:
     st.info("No data for the selected trailing window to build the trajectory.")
@@ -695,7 +715,7 @@ def _build_created_paid_monthly(df_all: pd.DataFrame,
     return monthly, agg
 
 # Apply the same union selection to df_clean for created & paid
-if picked_srcs:
+if 'picked_srcs' in locals() and picked_srcs:
     union_mask_all = make_union_mask(df_clean, per_source_config, use_key_sources)
 else:
     union_mask_all = pd.Series(False, index=df_clean.index)  # none selected -> empty
@@ -803,8 +823,8 @@ with tabs[2]:
 
 with tabs[3]:
     if 'mcs' in locals() and not mcs.empty:
-        show = mcs.rename(columns={country_col: "Country"})[["Country","_pay_m_str","_key_source","Cnt","TotalAll","PctOfOverall"]]
-        show = show.sort_values(["Country","_pay_m_str","_key_source"])
+        show = mcs.rename(columns={country_col: "Country"})[["Country","_pay_m_str","_traj_source","Cnt","TotalAll","PctOfOverall"]]
+        show = show.sort_values(["Country","_pay_m_str","_traj_source"])
         st.dataframe(show, use_container_width=True)
         st.download_button("Download CSV – Trajectory", show.to_csv(index=False).encode("utf-8"),
                            "trajectory_top_countries_sources.csv", "text/csv")
