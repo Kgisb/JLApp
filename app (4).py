@@ -1,7 +1,8 @@
 # app_8020.py 
 # JetLearn: 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer
-# Trajectory now supports: Key buckets OR all raw sources, and "Deal Source for Top Countries".
-# FIX: handle categorical groupby safely when "All sources" is selected.
+# Trajectory supports: Key buckets OR all raw sources, and "Deal Source for Top Countries".
+# FIX: safe categorical groupby when "All sources" is selected.
+# NEW: In Mix Analyzer > Specific mode, add "Any country (all)" option for each picked source.
 
 import streamlit as st
 import pandas as pd
@@ -377,11 +378,10 @@ if not mcs.empty:
     mcs = mcs.merge(monthly_total, on="_pay_m", how="left")
     mcs["PctOfOverall"] = np.where(mcs["TotalAll"]>0, mcs["Cnt"]/mcs["TotalAll"]*100.0, 0.0)
     mcs["_pay_m_str"] = pd.Categorical(mcs["_pay_m"].astype(str), categories=months_str, ordered=True)
-    # FIX: categorical -> safe groupby (remove unused levels to avoid ValueError)
+    # FIX: categorical -> safe groupby
     mcs["_pay_m_str"] = mcs["_pay_m_str"].cat.remove_unused_categories()
 
 if not mcs.empty:
-    # Sort color legend by frequency to keep legend stable & useful
     src_order = mcs["_traj_source"].value_counts().index.tolist()
     title_suffix = f"{traj_src_pick}" if traj_src_pick != "All sources" else "All sources"
     grouping_suffix = "Key" if traj_grouping.startswith("Key") else "Raw"
@@ -402,13 +402,11 @@ if not mcs.empty:
     )
     st.altair_chart(facet_chart, use_container_width=True)
 
-    # ---- Overall contribution lines (restricted to the chosen top countries set)
-    # FIX: categorical -> safe groupby (cast to str or use observed=True)
     overall = (
         mcs
-        .assign(_pay_m_str=mcs["_pay_m_str"].astype(str))        # ensure plain string
+        .assign(_pay_m_str=mcs["_pay_m_str"].astype(str))
         .groupby(["_pay_m_str","_traj_source"], observed=True, as_index=False)
-        .agg(Cnt=("Cnt","sum"), TotalAll=("TotalAll","first"))   # named agg for clarity
+        .agg(Cnt=("Cnt","sum"), TotalAll=("TotalAll","first"))
     )
     overall["PctOfOverall"] = np.where(overall["TotalAll"]>0, overall["Cnt"]/overall["TotalAll"]*100.0, 0.0)
 
@@ -466,24 +464,32 @@ else:
 def _mode_key(src): return f"src_mode::{src}"
 def _countries_key(src): return f"src_countries::{src}"
 
+# ---- NEW: constants for "Any country" sentinel
+DISPLAY_ANY = "Any country (all)"
+
 # Build per-source country pickers
 per_source_config = {}  # src -> dict(mode, countries, available)
 
 for src in picked_srcs:
+    # countries where this source actually has enrolments in window
     available = (
         cohort_now.loc[cohort_now["_src_pick"] == src, country_col]
         .astype(str).fillna("Unknown").value_counts().index.tolist()
         if country_col and country_col in cohort_now.columns else []
     )
+    # init defaults in session_state
     if _mode_key(src) not in st.session_state:
         st.session_state[_mode_key(src)] = "All"
     if _countries_key(src) not in st.session_state:
         st.session_state[_countries_key(src)] = available.copy()
 
+    # reconcile if options changed (e.g., date/source change)
     if st.session_state[_mode_key(src)] == "Specific":
-        st.session_state[_countries_key(src)] = [c for c in st.session_state[_countries_key(src)] if c in available]
+        # keep previously selected countries that still exist; also keep DISPLAY_ANY if it was chosen
+        prev = st.session_state[_countries_key(src)]
+        st.session_state[_countries_key(src)] = [c for c in prev if (c in available) or (c == DISPLAY_ANY)]
         if not st.session_state[_countries_key(src)] and available:
-            st.session_state[_countries_key(src)] = available[:5]
+            st.session_state[_countries_key(src)] = available[:5]  # a small sensible default
 
     with st.container(border=True):
         c1, c2 = st.columns([1, 2])
@@ -498,11 +504,14 @@ for src in picked_srcs:
             )
         with c2:
             if mode == "Specific":
+                # NEW: include "Any country (all)" as a special option
+                options = [DISPLAY_ANY] + available
                 st.multiselect(
                     f"Countries for {src}",
-                    options=available,
+                    options=options,
                     default=st.session_state[_countries_key(src)],
-                    key=_countries_key(src)
+                    key=_countries_key(src),
+                    help="Pick countries or choose 'Any country (all)' to include all countries for this source."
                 )
             elif mode == "All":
                 st.caption(f"All countries for **{src}** ({len(available)}).")
@@ -520,7 +529,7 @@ def make_union_mask(df: pd.DataFrame, per_cfg: dict, use_key: bool) -> pd.Series
     d = assign_src_pick(df, source_col, use_key)
     base = pd.Series(False, index=d.index)
     if not per_cfg:
-        return base
+        return base  # nothing selected -> nothing passes
     if country_col and country_col in d.columns:
         c_series = d[country_col].astype(str).fillna("Unknown")
     else:
@@ -533,9 +542,14 @@ def make_union_mask(df: pd.DataFrame, per_cfg: dict, use_key: bool) -> pd.Series
         src_mask = (d["_src_pick"] == src)
         if mode == "All":
             base = base | src_mask
-        else:
+        else:  # Specific
             chosen = set(info["countries"])
-            if chosen:
+            if not chosen:
+                continue
+            # NEW: if "Any country (all)" selected, treat like All for this source
+            if DISPLAY_ANY in chosen:
+                base = base | src_mask
+            else:
                 base = base | (src_mask & c_series.isin(chosen))
     return base
 
@@ -608,7 +622,7 @@ else:
             all_line = all_line[["Month","Series","SelCnt","TotalAll","PctOfOverall"]]
             all_line["Month"] = pd.Categorical(all_line["Month"], categories=months_in_range, ordered=True)
 
-            # Per-source monthly lines
+            # Per-source monthly lines honoring each source's country selection
             per_src_frames = []
             for src in active_sources(per_source_config):
                 one_cfg = {src: per_source_config[src]}
