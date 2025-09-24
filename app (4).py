@@ -164,9 +164,14 @@ if "data_src" not in st.session_state:
 
 with st.sidebar:
     st.header("JetLearn • Navigation")
-    view = st.radio("Go to", ["MIS", "Predictibility", "Trend & Analysis", "80-20", "Stuck deals"], index=0)
+    view = st.radio(
+        "Go to",
+        ["MIS", "Predictibility", "Trend & Analysis", "80-20", "Stuck deals"],  # ← add this
+        index=0
+    )
     track = st.radio("Track", ["Both", "AI Coding", "Math"], index=0)
     st.caption("Use MIS for status; Predictibility for forecast; Trend & Analysis for grouped drilldowns; 80-20 for Pareto & Mix.")
+
 
 st.title("📊 JetLearn – Unified App")
 
