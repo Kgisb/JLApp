@@ -612,10 +612,11 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
     realized_by_src = pd.DataFrame(columns=[source_col, "A"])
     else:
     # include Unknown deal source in Actual-to-date
-    realized_by_src = (
+        realized_by_src = (
         d_cur.assign(**{source_col: d_cur[source_col].fillna("Unknown").astype(str)})
             .groupby(source_col).size().rename("A").reset_index()
     )
+
 
     d_hist = d[d["_pay_m"] < cur_period].copy()
     rates_same, rates_prev, overall_same_rate, overall_prev_rate = daily_rates_from_lookback(
