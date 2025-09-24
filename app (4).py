@@ -3,7 +3,7 @@
 # Adds:
 # 1) Range KPI for Created/Enrolments/Conversion
 # 2) Interactive Mix Analyzer (existing)
-# 3) Deals vs Enrolments for your selection (bars = Enrolments only, optional Conversion% line)
+# 3) Deals vs Enrolments for your selection (grouped bars: Deals & Enrolments + optional Conversion% line)
 
 import streamlit as st
 import pandas as pd
@@ -587,7 +587,7 @@ else:
             )
 
 # =========================
-# Deals vs Enrolments — for your current selection (bars = Enrolments only)
+# Deals vs Enrolments — for your current selection (grouped bars + optional Conversion line)
 # =========================
 st.markdown("### Deals vs Enrolments — for your current selection")
 
@@ -694,19 +694,35 @@ with kpc:
         f"<div class='kpi-sub'>Num: {int(agg_sel['PaidCnt'].iloc[0]):,} • Den: {int(agg_sel['CreatedCnt'].iloc[0]):,}</div></div>",
         unsafe_allow_html=True)
 
-# ---- Month-wise chart: Bars = Enrolments only (+ optional Conversion% line)
-show_conv_line = st.checkbox("Overlay Conversion% line on enrolments chart", value=True, key="mix_conv_line")
+# ---- Month-wise chart: Grouped bars (Deals & Enrolments) + optional Conversion% line
+show_conv_line = st.checkbox("Overlay Conversion% line on bars", value=True, key="mix_conv_line")
 
 if not monthly_sel.empty:
-    # Bars: Enrolments only
-    bars = alt.Chart(monthly_sel).mark_bar(opacity=0.9).encode(
+    # Long format for grouped bars
+    bar_df = monthly_sel.melt(
+        id_vars=["Month"],
+        value_vars=["CreatedCnt", "PaidCnt"],
+        var_name="Metric",
+        value_name="Count"
+    )
+    bar_df["Metric"] = bar_df["Metric"].map({
+        "CreatedCnt": "Deals Created",
+        "PaidCnt": "Enrolments"
+    })
+
+    # Grouped bars per month
+    bars = alt.Chart(bar_df).mark_bar(opacity=0.9).encode(
         x=alt.X("Month:N", sort=monthly_sel["Month"].tolist(), title="Month"),
-        y=alt.Y("PaidCnt:Q", title="Enrolments"),
+        y=alt.Y("Count:Q", title="Count"),
+        color=alt.Color("Metric:N", title=""),
+        # xOffset requires Altair/Vega-Lite supporting grouped bars:
+        xOffset=alt.XOffset("Metric:N"),
         tooltip=[
             alt.Tooltip("Month:N"),
-            alt.Tooltip("PaidCnt:Q", title="Enrolments")
+            alt.Tooltip("Metric:N"),
+            alt.Tooltip("Count:Q")
         ]
-    ).properties(height=360, title="Month-wise — Enrolments (bars)")
+    ).properties(height=360, title="Month-wise — Deals & Enrolments (bars)")
 
     if show_conv_line:
         line = alt.Chart(monthly_sel).mark_line(point=True).encode(
