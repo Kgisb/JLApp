@@ -1,9 +1,9 @@
 # app_8020.py
 # JetLearn: 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer
 # Adds:
-# 1) Range KPI for Created/Enrolments/Conversion
-# 2) Interactive Mix Analyzer (existing)
-# 3) Deals vs Enrolments for your selection (grouped bars: Deals & Enrolments + optional Conversion% line)
+# - Range KPI for Created/Enrolments/Conversion
+# - Interactive Mix Analyzer with Source→Country dependency + All/None quick actions
+# - Deals vs Enrolments (grouped bars: Deals & Enrolments + optional Conversion% line)
 
 import streamlit as st
 import pandas as pd
@@ -391,10 +391,10 @@ with col_im1:
         help="On = group sources into the 3 key buckets. Off = use raw deal source names."
     )
 
-# Build selectable lists from the current cohort window
+# Build selectable lists from the current cohort window (payments inside window)
 cohort_now = df_clean[df_clean["_pay_dt"].dt.date.between(start_d, end_d)].copy()
 
-# Source options (and normalized key field)
+# Prepare a unified source-pick column based on key-source toggle
 if source_col and source_col in cohort_now.columns:
     if use_key_sources:
         cohort_now["_src_pick"] = cohort_now[source_col].apply(normalize_key_source)
@@ -405,26 +405,59 @@ if source_col and source_col in cohort_now.columns:
         src_options = sorted(cohort_now["_src_pick"].unique().tolist())
         default_srcs = cohort_now["_src_pick"].value_counts().head(5).index.tolist()
 
-    with col_im2:
-        picked_srcs = st.multiselect(
-            "Select Deal Sources",
-            options=src_options,
-            default=[s for s in default_srcs if s in src_options]
-        )
+    # Source multiselect
+    picked_srcs = st.multiselect(
+        "Select Deal Sources",
+        options=src_options,
+        default=[s for s in default_srcs if s in src_options],
+        help="Pick one or more deal sources. Country list below updates to only those with enrolments for the selected sources."
+    )
 else:
     picked_srcs = []
     st.info("Deal Source column not found, source filtering disabled for Mix Analyzer.")
 
-# Country options
+# ----- Dependent Country picker (filtered by selected sources) + All/None
 if country_col and country_col in cohort_now.columns:
-    country_counts = cohort_now[country_col].astype(str).fillna("Unknown").value_counts()
-    default_countries = country_counts.head(7).index.tolist()
-    with col_im3:
-        picked_countries = st.multiselect(
-            "Select Countries",
-            options=country_counts.index.tolist(),
-            default=default_countries
+    if picked_srcs:
+        src_mask_for_countries = cohort_now["_src_pick"].isin(picked_srcs)
+    else:
+        src_mask_for_countries = pd.Series(True, index=cohort_now.index)
+
+    available_countries = (
+        cohort_now.loc[src_mask_for_countries, country_col]
+        .astype(str).fillna("Unknown")
+        .value_counts()
+        .index.tolist()
+    )
+
+    country_key = "picked_countries_dynamic"
+    # initialize or reconcile selection with available options
+    if country_key not in st.session_state:
+        st.session_state[country_key] = available_countries.copy()
+    else:
+        st.session_state[country_key] = [c for c in st.session_state[country_key] if c in available_countries]
+        if not st.session_state[country_key] and available_countries:
+            st.session_state[country_key] = available_countries.copy()
+
+    col_c1, col_c2 = st.columns([3, 1])
+    with col_c1:
+        _ = st.multiselect(
+            "Select Countries (filtered by chosen sources)",
+            options=available_countries,
+            default=st.session_state[country_key],
+            key=country_key,
+            help="This list is filtered to countries that have enrolments for the selected sources in the chosen date window."
         )
+    with col_c2:
+        a1, a2 = st.columns(2)
+        with a1:
+            if st.button("All"):
+                st.session_state[country_key] = available_countries.copy()
+        with a2:
+            if st.button("None"):
+                st.session_state[country_key] = []
+
+    picked_countries = st.session_state[country_key]
 else:
     picked_countries = []
     st.info("Country column not found, country filtering disabled for Mix Analyzer.")
@@ -715,7 +748,6 @@ if not monthly_sel.empty:
         x=alt.X("Month:N", sort=monthly_sel["Month"].tolist(), title="Month"),
         y=alt.Y("Count:Q", title="Count"),
         color=alt.Color("Metric:N", title=""),
-        # xOffset requires Altair/Vega-Lite supporting grouped bars:
         xOffset=alt.XOffset("Metric:N"),
         tooltip=[
             alt.Tooltip("Month:N"),
