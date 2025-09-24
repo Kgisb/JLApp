@@ -1,7 +1,9 @@
-# app_8020.py
+# app_8020.py 
 # JetLearn: 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer
 # NEW: Per-source country filters with All/None/Specific in the Interactive Mix Analyzer.
 #      Each selected source gets its own country selector; downstream visuals use the OR-union.
+# NEW (this update): In Trajectory, pick a JetLearn Deal Source (All / Referral / PM-Search / PM-Social).
+#      Top countries are computed by cohort enrolments for the chosen source and visuals update accordingly.
 
 import streamlit as st
 import pandas as pd
@@ -314,12 +316,20 @@ else:
 # ----------------------------
 st.markdown("### Trajectory – Top Countries × Referral / PM - Search / PM - Social")
 
-col_t1, col_t2 = st.columns(2)
+col_t1, col_t2, col_t3 = st.columns([1, 1, 1.2])
 with col_t1:
     trailing_k = st.selectbox("Trailing window (months)", [3, 6, 12], index=0,
                               help="Monthly trajectory ends at your selected end date.")
 with col_t2:
     top_k = st.selectbox("Top countries (by cohort enrolments)", [5, 7], index=0)
+with col_t3:
+    # NEW: Choose which deal source to use for picking top countries & building trajectory
+    traj_src_pick = st.selectbox(
+        "Deal Source for Top Countries",
+        options=["All sources", "Referral", "PM - Search", "PM - Social"],
+        index=0,
+        help="Top countries and charts will be computed from payments of this source (or all sources) in the trailing window."
+    )
 
 months_list = months_back_list(end_d, trailing_k)
 months_str = [str(p) for p in months_list]
@@ -327,18 +337,27 @@ months_str = [str(p) for p in months_list]
 df_trail = df_clean[df_clean["_pay_m"].isin(months_list)].copy()
 df_trail["_key_source"] = df_trail[source_col].apply(normalize_key_source) if source_col else "Other"
 
-# Top K countries across trailing window
+# ---- NEW: Filter the trailing cohort by chosen source when picking top countries & building series
+if traj_src_pick != "All sources":
+    df_trail_src = df_trail[df_trail["_key_source"] == traj_src_pick].copy()
+else:
+    df_trail_src = df_trail.copy()
+
+# Top K countries across trailing window (based on chosen source cohort)
 if country_col:
-    cty_counts = df_trail.groupby(country_col).size().sort_values(ascending=False)
+    cty_counts = df_trail_src.groupby(country_col).size().sort_values(ascending=False)
     top_countries = cty_counts.head(top_k).index.astype(str).tolist()
 else:
     top_countries = []
 
+# Monthly total enrolments (all sources or chosen source?) 
+# For "% of overall business", the denominator should be overall (total payments in that month, across all sources).
 monthly_total = df_trail.groupby("_pay_m").size().rename("TotalAll").reset_index()
 
+# Build (Month, Country, KeySource) counts for the chosen source cohort, restricted to top countries
 if top_countries and source_col and country_col:
     mcs = (
-        df_trail[df_trail[country_col].astype(str).isin(top_countries)]
+        df_trail_src[df_trail_src[country_col].astype(str).isin(top_countries)]
         .groupby(["_pay_m", country_col, "_key_source"]).size().rename("Cnt").reset_index()
     )
 else:
@@ -351,6 +370,7 @@ if not mcs.empty:
     mcs["_pay_m_str"] = pd.Categorical(mcs["_pay_m"].astype(str), categories=months_str, ordered=True)
 
 if not mcs.empty:
+    title_suffix = traj_src_pick if traj_src_pick != "All sources" else "All sources"
     facet_chart = alt.Chart(mcs).mark_bar(opacity=0.9).encode(
         x=alt.X("_pay_m_str:N", title="Month", sort=months_str),
         y=alt.Y("PctOfOverall:Q", title="% of overall business", scale=alt.Scale(domain=[0, 100])),
@@ -363,11 +383,12 @@ if not mcs.empty:
             alt.Tooltip("Cnt:Q", title="Count"),
             alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f")
         ]
-    ).properties(height=220).facet(
+    ).properties(height=220, title=f"Top Countries • Source basis: {title_suffix}").facet(
         column=alt.Column(f"{country_col}:N", title="Top Countries", sort=top_countries)
     )
     st.altair_chart(facet_chart, use_container_width=True)
 
+    # Overall contribution lines (restricted to top countries set)
     overall = (
         mcs.groupby(["_pay_m_str","_key_source"], as_index=False)
            .agg({"Cnt":"sum", "TotalAll":"first"})
@@ -383,7 +404,7 @@ if not mcs.empty:
             alt.Tooltip("_key_source:N", title="Source"),
             alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f")
         ]
-    ).properties(title="Overall contribution of key sources (restricted to Top countries)", height=320)
+    ).properties(title=f"Overall contribution of key sources (Top countries • Source basis: {title_suffix})", height=320)
     st.altair_chart(lines, use_container_width=True)
 else:
     st.info("No data for the selected trailing window to build the trajectory.")
