@@ -1,9 +1,9 @@
 # app_8020.py
 # JetLearn: 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer
-# This version restores the previously working app and adds:
+# Adds:
 # 1) Range KPI for Created/Enrolments/Conversion
 # 2) Interactive Mix Analyzer (existing)
-# 3) NEW: Deals vs Enrolments for your selection (+ optional Conversion% line)
+# 3) Deals vs Enrolments for your selection (+ optional Conversion% line)
 
 import streamlit as st
 import pandas as pd
@@ -198,7 +198,7 @@ if source_col:
 else:
     picked_sources = None
 
-# Conversion mode toggle (kept for other visuals; KPI below ignores this toggle as requested)
+# Conversion mode toggle (kept for other visuals; KPI below ignores this toggle)
 st.sidebar.header("Conversion%")
 conv_mode = st.sidebar.radio(
     "Mode", ["MTD", "Cohort"], index=0, horizontal=True,
@@ -216,11 +216,9 @@ if picked_sources is not None and source_col:
 # ----------------------------
 # NEW SIMPLE KPI: Deals Created, Enrolments, Conversion% (range-based)
 # ----------------------------
-# Denominator: created in selected date range
 in_create_window = df_clean["_create_dt"].dt.date.between(start_d, end_d)
 deals_created = int(in_create_window.sum())
 
-# Numerator: payments received in selected date range
 in_pay_window = df_clean["_pay_dt"].dt.date.between(start_d, end_d)
 enrolments = int(in_pay_window.sum())
 
@@ -236,7 +234,7 @@ with cC:
     st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Conversion% (Payments / Created)</div><div class='kpi-value'>{conv_pct_simple:.1f}%</div><div class='kpi-sub'>Num: {enrolments:,} • Den: {deals_created:,}</div></div>", unsafe_allow_html=True)
 
 # ----------------------------
-# Existing Cohort KPIs
+# Cohort KPIs
 # ----------------------------
 st.markdown("<div class='section-title'>Cohort KPIs</div>", unsafe_allow_html=True)
 total_enr = int(len(df_cohort))
@@ -589,12 +587,11 @@ else:
             )
 
 # =========================
-# NEW: Deals vs Enrolments (+ optional Conversion%) for your current selection
+# Deals vs Enrolments — for your current selection (+ optional Conversion% line)
 # =========================
 st.markdown("### Deals vs Enrolments — for your current selection")
 
 def _mk_src_pick_column(d: pd.DataFrame) -> pd.Series:
-    """Create a source-pick column consistent with the Mix Analyzer toggle."""
     if source_col and source_col in d.columns:
         if 'use_key_sources' in locals() and use_key_sources:
             return d[source_col].apply(normalize_key_source)
@@ -609,7 +606,7 @@ def _build_created_paid_monthly(df_all: pd.DataFrame,
     """
     Returns:
       monthly_df: Month, CreatedCnt, PaidCnt, ConvPct
-      agg_df: a single-row aggregate with CreatedCnt, PaidCnt, ConvPct over the full range
+      agg_df: aggregate row with CreatedCnt, PaidCnt, ConvPct
     """
     d = df_all.copy()
     d["_src_pick"] = _mk_src_pick_column(d)
@@ -618,47 +615,43 @@ def _build_created_paid_monthly(df_all: pd.DataFrame,
     d["_cmonth"] = d["_create_dt"].dt.to_period("M")
     d["_pmonth"] = d["_pay_dt"].dt.to_period("M")
 
-    # ---- selection masks (same logic as Mix Analyzer)
+    # selection masks
     sel_mask = pd.Series(True, index=d.index)
     if country_col and 'picked_countries' in locals() and picked_countries:
         sel_mask &= d[country_col].astype(str).isin(picked_countries)
     if source_col and sources_for_lines:
         sel_mask &= d["_src_pick"].isin(sources_for_lines)
 
-    # ---- window masks
+    # window masks
     cwin = d["_cdate"].between(start_d, end_d)
     pwin = d["_pdate"].between(start_d, end_d)
 
-    # ---- month universe in range (calendar months between start and end)
+    # calendar months in range
     month_index = pd.period_range(start=start_d.replace(day=1),
                                   end=end_d.replace(day=1),
                                   freq="M")
 
-    # ---- monthly counts (respect selection + window)
+    # monthly counts
     created_m = (
         d.loc[sel_mask & cwin]
           .groupby("_cmonth").size()
-          .rename("CreatedCnt")
           .reindex(month_index, fill_value=0)
-          .reset_index(names="_month")
+          .rename_axis(index="_month").reset_index(name="CreatedCnt")
     )
     paid_m = (
         d.loc[sel_mask & pwin]
           .groupby("_pmonth").size()
-          .rename("PaidCnt")
           .reindex(month_index, fill_value=0)
-          .reset_index(names="_month")
+          .rename_axis(index="_month").reset_index(name="PaidCnt")
     )
 
-    monthly = created_m.merge(paid_m, left_on="_month", right_on="_month", how="outer").fillna(0)
+    monthly = created_m.merge(paid_m, on="_month", how="outer").fillna(0)
     monthly["Month"] = monthly["_month"].astype(str)
     monthly = monthly[["Month", "CreatedCnt", "PaidCnt"]]
 
-    # Conversion% (guard divide-by-zero)
     monthly["ConvPct"] = np.where(monthly["CreatedCnt"] > 0,
                                   monthly["PaidCnt"] / monthly["CreatedCnt"] * 100.0, 0.0)
 
-    # Aggregate row
     total_created = int(monthly["CreatedCnt"].sum())
     total_paid    = int(monthly["PaidCnt"].sum())
     agg = pd.DataFrame({
@@ -669,7 +662,7 @@ def _build_created_paid_monthly(df_all: pd.DataFrame,
 
     return monthly, agg
 
-# Ensure sources_for_lines exists (fallbacks if user cleared selection)
+# ensure sources_for_lines exists
 if source_col:
     try:
         sources_for_lines  # noqa: F401
@@ -682,7 +675,7 @@ monthly_sel, agg_sel = _build_created_paid_monthly(
     sources_for_lines if 'sources_for_lines' in locals() else []
 )
 
-# ---- Aggregate KPI row
+# Aggregate KPIs
 kpa, kpb, kpc = st.columns(3)
 with kpa:
     st.markdown(
@@ -701,11 +694,10 @@ with kpc:
         f"<div class='kpi-sub'>Num: {int(agg_sel['PaidCnt'].iloc[0]):,} • Den: {int(agg_sel['CreatedCnt'].iloc[0]):,}</div></div>",
         unsafe_allow_html=True)
 
-# ---- Month-wise combined chart (bars + optional conversion line)
+# Month-wise combined chart (bars + optional conversion line)
 show_conv_line = st.checkbox("Overlay Conversion% line on month-wise chart", value=True, key="mix_conv_line")
 
 if not monthly_sel.empty:
-    # Melt to long for bar chart
     bar_df = monthly_sel.melt(id_vars=["Month"], value_vars=["CreatedCnt", "PaidCnt"],
                               var_name="Metric", value_name="Count")
     bar_df["Metric"] = bar_df["Metric"].map({"CreatedCnt": "Deals Created", "PaidCnt": "Enrolments"})
@@ -736,7 +728,6 @@ if not monthly_sel.empty:
     else:
         st.altair_chart(bars, use_container_width=True)
 
-    # Download table
     with st.expander("Download: Month-wise Deals / Enrolments / Conversion% (selection)"):
         out_tbl = monthly_sel.rename(columns={
             "CreatedCnt": "Deals Created",
