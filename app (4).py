@@ -1,8 +1,9 @@
 # app_8020.py
 # JetLearn: 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer
-# This version restores the previously working app and adds a simple KPI:
-# Deals Created (Create Date count), Enrolments (Payment Received count),
-# and Conversion% = Enrolments / Deals Created for the selected date range.
+# This version restores the previously working app and adds:
+# 1) Range KPI for Created/Enrolments/Conversion
+# 2) Interactive Mix Analyzer (existing)
+# 3) NEW: Deals vs Enrolments for your selection (+ optional Conversion% line)
 
 import streamlit as st
 import pandas as pd
@@ -235,7 +236,7 @@ with cC:
     st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Conversion% (Payments / Created)</div><div class='kpi-value'>{conv_pct_simple:.1f}%</div><div class='kpi-sub'>Num: {enrolments:,} • Den: {deals_created:,}</div></div>", unsafe_allow_html=True)
 
 # ----------------------------
-# Existing KPIs based on cohort subset (for context)
+# Existing Cohort KPIs
 # ----------------------------
 st.markdown("<div class='section-title'>Cohort KPIs</div>", unsafe_allow_html=True)
 total_enr = int(len(df_cohort))
@@ -586,6 +587,171 @@ else:
                 file_name="mix_selection_monthwise_lines.csv",
                 mime="text/csv"
             )
+
+# =========================
+# NEW: Deals vs Enrolments (+ optional Conversion%) for your current selection
+# =========================
+st.markdown("### Deals vs Enrolments — for your current selection")
+
+def _mk_src_pick_column(d: pd.DataFrame) -> pd.Series:
+    """Create a source-pick column consistent with the Mix Analyzer toggle."""
+    if source_col and source_col in d.columns:
+        if 'use_key_sources' in locals() and use_key_sources:
+            return d[source_col].apply(normalize_key_source)
+        else:
+            return d[source_col].fillna("Unknown").astype(str)
+    return pd.Series("Other", index=d.index)
+
+def _build_created_paid_monthly(df_all: pd.DataFrame,
+                                start_d: date, end_d: date,
+                                picked_countries: list[str],
+                                sources_for_lines: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Returns:
+      monthly_df: Month, CreatedCnt, PaidCnt, ConvPct
+      agg_df: a single-row aggregate with CreatedCnt, PaidCnt, ConvPct over the full range
+    """
+    d = df_all.copy()
+    d["_src_pick"] = _mk_src_pick_column(d)
+    d["_cdate"] = d["_create_dt"].dt.date
+    d["_pdate"] = d["_pay_dt"].dt.date
+    d["_cmonth"] = d["_create_dt"].dt.to_period("M")
+    d["_pmonth"] = d["_pay_dt"].dt.to_period("M")
+
+    # ---- selection masks (same logic as Mix Analyzer)
+    sel_mask = pd.Series(True, index=d.index)
+    if country_col and 'picked_countries' in locals() and picked_countries:
+        sel_mask &= d[country_col].astype(str).isin(picked_countries)
+    if source_col and sources_for_lines:
+        sel_mask &= d["_src_pick"].isin(sources_for_lines)
+
+    # ---- window masks
+    cwin = d["_cdate"].between(start_d, end_d)
+    pwin = d["_pdate"].between(start_d, end_d)
+
+    # ---- month universe in range (calendar months between start and end)
+    month_index = pd.period_range(start=start_d.replace(day=1),
+                                  end=end_d.replace(day=1),
+                                  freq="M")
+
+    # ---- monthly counts (respect selection + window)
+    created_m = (
+        d.loc[sel_mask & cwin]
+          .groupby("_cmonth").size()
+          .rename("CreatedCnt")
+          .reindex(month_index, fill_value=0)
+          .reset_index(names="_month")
+    )
+    paid_m = (
+        d.loc[sel_mask & pwin]
+          .groupby("_pmonth").size()
+          .rename("PaidCnt")
+          .reindex(month_index, fill_value=0)
+          .reset_index(names="_month")
+    )
+
+    monthly = created_m.merge(paid_m, left_on="_month", right_on="_month", how="outer").fillna(0)
+    monthly["Month"] = monthly["_month"].astype(str)
+    monthly = monthly[["Month", "CreatedCnt", "PaidCnt"]]
+
+    # Conversion% (guard divide-by-zero)
+    monthly["ConvPct"] = np.where(monthly["CreatedCnt"] > 0,
+                                  monthly["PaidCnt"] / monthly["CreatedCnt"] * 100.0, 0.0)
+
+    # Aggregate row
+    total_created = int(monthly["CreatedCnt"].sum())
+    total_paid    = int(monthly["PaidCnt"].sum())
+    agg = pd.DataFrame({
+        "CreatedCnt": [total_created],
+        "PaidCnt":    [total_paid],
+        "ConvPct":    [float((total_paid / total_created * 100.0) if total_created > 0 else 0.0)]
+    })
+
+    return monthly, agg
+
+# Ensure sources_for_lines exists (fallbacks if user cleared selection)
+if source_col:
+    try:
+        sources_for_lines  # noqa: F401
+    except NameError:
+        sources_for_lines = picked_srcs if picked_srcs else (src_options if source_col else [])
+
+monthly_sel, agg_sel = _build_created_paid_monthly(
+    df_clean, start_d, end_d,
+    picked_countries if 'picked_countries' in locals() else [],
+    sources_for_lines if 'sources_for_lines' in locals() else []
+)
+
+# ---- Aggregate KPI row
+kpa, kpb, kpc = st.columns(3)
+with kpa:
+    st.markdown(
+        f"<div class='kpi-card'><div class='kpi-title'>Deals (Created)</div>"
+        f"<div class='kpi-value'>{int(agg_sel['CreatedCnt'].iloc[0]):,}</div>"
+        f"<div class='kpi-sub'>{start_d} → {end_d}</div></div>", unsafe_allow_html=True)
+with kpb:
+    st.markdown(
+        f"<div class='kpi-card'><div class='kpi-title'>Enrolments (Payments)</div>"
+        f"<div class='kpi-value'>{int(agg_sel['PaidCnt'].iloc[0]):,}</div>"
+        f"<div class='kpi-sub'>{start_d} → {end_d}</div></div>", unsafe_allow_html=True)
+with kpc:
+    st.markdown(
+        f"<div class='kpi-card'><div class='kpi-title'>Conversion% (Payments / Created)</div>"
+        f"<div class='kpi-value'>{float(agg_sel['ConvPct'].iloc[0]):.1f}%</div>"
+        f"<div class='kpi-sub'>Num: {int(agg_sel['PaidCnt'].iloc[0]):,} • Den: {int(agg_sel['CreatedCnt'].iloc[0]):,}</div></div>",
+        unsafe_allow_html=True)
+
+# ---- Month-wise combined chart (bars + optional conversion line)
+show_conv_line = st.checkbox("Overlay Conversion% line on month-wise chart", value=True, key="mix_conv_line")
+
+if not monthly_sel.empty:
+    # Melt to long for bar chart
+    bar_df = monthly_sel.melt(id_vars=["Month"], value_vars=["CreatedCnt", "PaidCnt"],
+                              var_name="Metric", value_name="Count")
+    bar_df["Metric"] = bar_df["Metric"].map({"CreatedCnt": "Deals Created", "PaidCnt": "Enrolments"})
+
+    bars = alt.Chart(bar_df).mark_bar(opacity=0.9).encode(
+        x=alt.X("Month:N", sort=monthly_sel["Month"].tolist(), title="Month"),
+        y=alt.Y("Count:Q", title="Count"),
+        color=alt.Color("Metric:N", title=""),
+        tooltip=[
+            alt.Tooltip("Month:N"),
+            alt.Tooltip("Metric:N"),
+            alt.Tooltip("Count:Q")
+        ]
+    ).properties(height=360, title="Month-wise — Deals vs Enrolments (for your current selection)")
+
+    if show_conv_line:
+        line = alt.Chart(monthly_sel).mark_line(point=True).encode(
+            x=alt.X("Month:N", sort=monthly_sel["Month"].tolist(), title="Month"),
+            y=alt.Y("ConvPct:Q", title="Conversion%", axis=alt.Axis(orient="right")),
+            tooltip=[
+                alt.Tooltip("Month:N"),
+                alt.Tooltip("ConvPct:Q", title="Conversion%", format=".1f")
+            ],
+            color=alt.value("#16a34a")
+        )
+        combo = alt.layer(bars, line).resolve_scale(y='independent')
+        st.altair_chart(combo, use_container_width=True)
+    else:
+        st.altair_chart(bars, use_container_width=True)
+
+    # Download table
+    with st.expander("Download: Month-wise Deals / Enrolments / Conversion% (selection)"):
+        out_tbl = monthly_sel.rename(columns={
+            "CreatedCnt": "Deals Created",
+            "PaidCnt": "Enrolments",
+            "ConvPct": "Conversion %"
+        })
+        st.dataframe(out_tbl, use_container_width=True)
+        st.download_button(
+            "Download CSV – Month-wise Deals/Enrolments/Conversion",
+            data=out_tbl.to_csv(index=False).encode("utf-8"),
+            file_name="selection_deals_enrolments_conversion_monthwise.csv",
+            mime="text/csv"
+        )
+else:
+    st.info("No month-wise data to plot for the current selection.")
 
 # ----------------------------
 # Tables + Downloads
