@@ -1,9 +1,7 @@
 # app_8020.py
 # JetLearn: 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer
-# Adds:
-# - Range KPI for Created/Enrolments/Conversion
-# - Interactive Mix Analyzer with Source→Country dependency + All/None quick actions
-# - Deals vs Enrolments (grouped bars: Deals & Enrolments + optional Conversion% line)
+# NEW: Per-source country filters with All/None/Specific in the Interactive Mix Analyzer.
+#      Each selected source gets its own country selector; downstream visuals use the OR-union.
 
 import streamlit as st
 import pandas as pd
@@ -146,6 +144,18 @@ def normalize_key_source(val: str) -> str:
     if "pm" in v and "social" in v:
         return "PM - Social"
     return "Other"
+
+# Build a unified _src_pick column on any dataframe based on toggle
+def assign_src_pick(df: pd.DataFrame, source_col: str | None, use_key: bool) -> pd.DataFrame:
+    d = df.copy()
+    if source_col and source_col in d.columns:
+        if use_key:
+            d["_src_pick"] = d[source_col].apply(normalize_key_source)
+        else:
+            d["_src_pick"] = d[source_col].fillna("Unknown").astype(str)
+    else:
+        d["_src_pick"] = "Other"
+    return d
 
 # ----------------------------
 # Load data
@@ -378,89 +388,124 @@ if not mcs.empty:
 else:
     st.info("No data for the selected trailing window to build the trajectory.")
 
-# ----------------------------
-# Interactive Mix Analyzer — choose Sources & Countries → % of overall
-# ----------------------------
+# ============================================================
+# Interactive Mix Analyzer — per-source country filters (All/None/Specific)
+# ============================================================
 st.markdown("### Interactive Mix Analyzer — % of overall business from your selection")
 
-col_im1, col_im2, col_im3 = st.columns([1.3, 1, 1])
+col_im1, col_im2 = st.columns([1.6, 1])
 with col_im1:
     use_key_sources = st.checkbox(
         "Use key-source mapping (Referral / PM - Search / PM - Social)",
         value=True,
-        help="On = group sources into the 3 key buckets. Off = use raw deal source names."
+        help="On = group sources into 3 key buckets. Off = raw deal source names."
     )
 
-# Build selectable lists from the current cohort window (payments inside window)
+# Cohort within window (payments inside window)
 cohort_now = df_clean[df_clean["_pay_dt"].dt.date.between(start_d, end_d)].copy()
+cohort_now = assign_src_pick(cohort_now, source_col, use_key_sources)
 
-# Prepare a unified source-pick column based on key-source toggle
+# Source option list
 if source_col and source_col in cohort_now.columns:
     if use_key_sources:
-        cohort_now["_src_pick"] = cohort_now[source_col].apply(normalize_key_source)
         src_options = ["Referral", "PM - Search", "PM - Social", "Other"]
-        default_srcs = ["Referral", "PM - Search", "PM - Social"]
+        default_srcs = ["Referral"]
     else:
-        cohort_now["_src_pick"] = cohort_now[source_col].fillna("Unknown").astype(str)
         src_options = sorted(cohort_now["_src_pick"].unique().tolist())
-        default_srcs = cohort_now["_src_pick"].value_counts().head(5).index.tolist()
-
-    # Source multiselect
+        default_srcs = src_options[:1] if src_options else []
     picked_srcs = st.multiselect(
         "Select Deal Sources",
         options=src_options,
         default=[s for s in default_srcs if s in src_options],
-        help="Pick one or more deal sources. Country list below updates to only those with enrolments for the selected sources."
+        help="Pick one or more sources. Each source gets its own Country control below.",
+        key="mix_sources_pick"
     )
 else:
     picked_srcs = []
     st.info("Deal Source column not found, source filtering disabled for Mix Analyzer.")
 
-# ----- Dependent Country picker (filtered by selected sources) + All/None
-if country_col and country_col in cohort_now.columns:
-    if picked_srcs:
-        src_mask_for_countries = cohort_now["_src_pick"].isin(picked_srcs)
-    else:
-        src_mask_for_countries = pd.Series(True, index=cohort_now.index)
+# Session keys storers
+def _mode_key(src): return f"src_mode::{src}"
+def _countries_key(src): return f"src_countries::{src}"
 
-    available_countries = (
-        cohort_now.loc[src_mask_for_countries, country_col]
-        .astype(str).fillna("Unknown")
-        .value_counts()
-        .index.tolist()
+# Build per-source country pickers
+per_source_config = {}  # src -> dict(mode, countries, available)
+
+for src in picked_srcs:
+    # countries where this source actually has enrolments in window
+    available = (
+        cohort_now.loc[cohort_now["_src_pick"] == src, country_col]
+        .astype(str).fillna("Unknown").value_counts().index.tolist()
+        if country_col and country_col in cohort_now.columns else []
     )
+    # init defaults in session_state
+    if _mode_key(src) not in st.session_state:
+        st.session_state[_mode_key(src)] = "All"
+    if _countries_key(src) not in st.session_state:
+        st.session_state[_countries_key(src)] = available.copy()
 
-    country_key = "picked_countries_dynamic"
-    # initialize or reconcile selection with available options
-    if country_key not in st.session_state:
-        st.session_state[country_key] = available_countries.copy()
+    # reconcile if options changed (e.g., date/source change)
+    if st.session_state[_mode_key(src)] == "Specific":
+        st.session_state[_countries_key(src)] = [c for c in st.session_state[_countries_key(src)] if c in available]
+        if not st.session_state[_countries_key(src)] and available:
+            st.session_state[_countries_key(src)] = available[:5]  # a small sensible default
+
+    with st.container(border=True):
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            st.markdown(f"**Source:** {src}")
+            mode = st.radio(
+                "Country scope",
+                options=["All", "None", "Specific"],
+                index=["All", "None", "Specific"].index(st.session_state[_mode_key(src)]),
+                key=_mode_key(src),
+                horizontal=True
+            )
+        with c2:
+            if mode == "Specific":
+                st.multiselect(
+                    f"Countries for {src}",
+                    options=available,
+                    default=st.session_state[_countries_key(src)],
+                    key=_countries_key(src)
+                )
+            elif mode == "All":
+                st.caption(f"All countries for **{src}** ({len(available)}).")
+            else:
+                st.caption(f"Excluded **{src}** (no countries).")
+
+    per_source_config[src] = {
+        "mode": st.session_state[_mode_key(src)],
+        "countries": st.session_state[_countries_key(src)],
+        "available": available
+    }
+
+# Helper: build masks from per-source config
+def make_union_mask(df: pd.DataFrame, per_cfg: dict, use_key: bool) -> pd.Series:
+    d = assign_src_pick(df, source_col, use_key)
+    base = pd.Series(False, index=d.index)
+    if not per_cfg:
+        return base  # nothing selected -> nothing passes
+    if country_col and country_col in d.columns:
+        c_series = d[country_col].astype(str).fillna("Unknown")
     else:
-        st.session_state[country_key] = [c for c in st.session_state[country_key] if c in available_countries]
-        if not st.session_state[country_key] and available_countries:
-            st.session_state[country_key] = available_countries.copy()
+        c_series = pd.Series("Unknown", index=d.index)
 
-    col_c1, col_c2 = st.columns([3, 1])
-    with col_c1:
-        _ = st.multiselect(
-            "Select Countries (filtered by chosen sources)",
-            options=available_countries,
-            default=st.session_state[country_key],
-            key=country_key,
-            help="This list is filtered to countries that have enrolments for the selected sources in the chosen date window."
-        )
-    with col_c2:
-        a1, a2 = st.columns(2)
-        with a1:
-            if st.button("All"):
-                st.session_state[country_key] = available_countries.copy()
-        with a2:
-            if st.button("None"):
-                st.session_state[country_key] = []
+    for src, info in per_cfg.items():
+        mode = info["mode"]
+        if mode == "None":
+            continue
+        src_mask = (d["_src_pick"] == src)
+        if mode == "All":
+            base = base | src_mask
+        else:  # Specific
+            chosen = set(info["countries"])
+            if chosen:
+                base = base | (src_mask & c_series.isin(chosen))
+    return base
 
-    picked_countries = st.session_state[country_key]
-else:
-    picked_countries = []
-    st.info("Country column not found, country filtering disabled for Mix Analyzer.")
+def active_sources(per_cfg: dict) -> list[str]:
+    return [s for s, v in per_cfg.items() if v["mode"] != "None"]
 
 # ---- View toggle
 mix_view = st.radio(
@@ -471,27 +516,16 @@ mix_view = st.radio(
     help="Aggregate = single % for whole range. Month-wise = monthly % time series with one line per picked source."
 )
 
-# Compute % of overall
+# Compute % of overall (payments)
 total_payments = int(len(cohort_now))
-
 if total_payments == 0:
     st.warning("No payments (enrolments) in the selected window.")
 else:
-    # base masks from picks
-    base_mask = pd.Series(True, index=cohort_now.index)
-    if picked_countries and country_col:
-        base_mask &= cohort_now[country_col].astype(str).isin(picked_countries)
-
-    # sources to use for lines (fall back to all options if user cleared selection)
-    sources_for_lines = picked_srcs if picked_srcs else (src_options if source_col else [])
-
-    if mix_view == "Aggregate (range total)":
-        # ----- Aggregate KPI -----
-        agg_mask = base_mask.copy()
-        if sources_for_lines and source_col:
-            agg_mask &= cohort_now["_src_pick"].isin(sources_for_lines)
-
-        selected_payments = int(agg_mask.sum())
+    sel_mask = make_union_mask(cohort_now, per_source_config, use_key_sources)
+    if not sel_mask.any():
+        st.info("No selection applied (pick at least one source in All/Specific).")
+    else:
+        selected_payments = int(sel_mask.sum())
         pct_of_overall = (selected_payments / total_payments * 100.0) if total_payments > 0 else 0.0
 
         st.markdown(
@@ -504,176 +538,122 @@ else:
         )
 
         # Quick breakdown by source (as % of overall)
-        if source_col:
-            breakdown = (
-                cohort_now.loc[agg_mask]
-                .groupby("_src_pick").size().rename("SelCnt").reset_index()
+        dsel = cohort_now.loc[sel_mask].copy()
+        if not dsel.empty:
+            bysrc = dsel.groupby("_src_pick").size().rename("SelCnt").reset_index()
+            bysrc["PctOfOverall"] = bysrc["SelCnt"] / total_payments * 100.0
+            chart = alt.Chart(bysrc).mark_bar(opacity=0.9).encode(
+                x=alt.X("_src_pick:N", title="Source"),
+                y=alt.Y("PctOfOverall:Q", title="% of overall business"),
+                tooltip=[alt.Tooltip("_src_pick:N", title="Source"),
+                         alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
+                         alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f")],
+                color=alt.Color("_src_pick:N", legend=alt.Legend(orient="bottom"))
+            ).properties(height=320, title="Selection breakdown by source — % of overall")
+            st.altair_chart(chart, use_container_width=True)
+
+        # ---------------- Month-wise lines (optional view)
+        if mix_view == "Month-wise":
+            cohort_now["_pay_m"] = cohort_now["_pay_dt"].dt.to_period("M")
+            months_in_range = (
+                cohort_now["_pay_m"].dropna().sort_values().unique().astype(str).tolist()
             )
-            if not breakdown.empty:
-                breakdown["PctOfOverall"] = breakdown["SelCnt"] / total_payments * 100.0
-                breakdown = breakdown.sort_values("PctOfOverall", ascending=False)
-                chart = alt.Chart(breakdown).mark_bar(opacity=0.9).encode(
-                    x=alt.X("_src_pick:N", title="Source"),
-                    y=alt.Y("PctOfOverall:Q", title="% of overall business"),
-                    tooltip=[
-                        alt.Tooltip("_src_pick:N", title="Source"),
-                        alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
-                        alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f"),
-                    ],
-                    color=alt.Color("_src_pick:N", legend=alt.Legend(orient="bottom"))
-                ).properties(height=320, title="Selection breakdown by source — % of overall")
-                st.altair_chart(chart, use_container_width=True)
 
-    else:
-        # ----- Month-wise lines: All Selected + lines per picked source -----
-        cohort_now["_pay_m"] = cohort_now["_pay_dt"].dt.to_period("M")
-        months_in_range = (
-            cohort_now["_pay_m"].dropna().sort_values().unique().astype(str).tolist()
-        )
+            # Overall monthly totals
+            overall_m = cohort_now.groupby("_pay_m").size().rename("TotalAll").reset_index()
+            overall_m["Month"] = overall_m["_pay_m"].astype(str)
 
-        # Overall totals per month (denominator for % of overall)
-        overall_m = cohort_now.groupby("_pay_m").size().rename("TotalAll").reset_index()
-        overall_m["Month"] = overall_m["_pay_m"].astype(str)
+            # All Selected monthly counts using union mask
+            all_sel_m = cohort_now.loc[sel_mask].groupby("_pay_m").size().rename("SelCnt").reset_index()
+            all_sel_m["Month"] = all_sel_m["_pay_m"].astype(str)
 
-        # "All Selected" monthly counts = sources (picked) + countries (picked)
-        all_sel_mask = base_mask.copy()
-        if sources_for_lines and source_col:
-            all_sel_mask &= cohort_now["_src_pick"].isin(sources_for_lines)
-        sel_all_m = cohort_now.loc[all_sel_mask].groupby("_pay_m").size().rename("SelCnt").reset_index()
-        sel_all_m["Month"] = sel_all_m["_pay_m"].astype(str)
+            all_line = overall_m.merge(all_sel_m[["_pay_m","SelCnt","Month"]], on=["_pay_m","Month"], how="left").fillna({"SelCnt":0})
+            all_line["PctOfOverall"] = np.where(all_line["TotalAll"]>0, all_line["SelCnt"]/all_line["TotalAll"]*100.0, 0.0)
+            all_line["Series"] = "All Selected"
+            all_line = all_line[["Month","Series","SelCnt","TotalAll","PctOfOverall"]]
+            all_line["Month"] = pd.Categorical(all_line["Month"], categories=months_in_range, ordered=True)
 
-        all_line = overall_m.merge(sel_all_m[["_pay_m","SelCnt","Month"]], on=["_pay_m","Month"], how="left").fillna({"SelCnt":0})
-        all_line["PctOfOverall"] = np.where(all_line["TotalAll"]>0, all_line["SelCnt"]/all_line["TotalAll"]*100.0, 0.0)
-        all_line["Series"] = "All Selected"
-        all_line = all_line[["Month","Series","SelCnt","TotalAll","PctOfOverall"]]
-        all_line["Month"] = pd.Categorical(all_line["Month"], categories=months_in_range, ordered=True)
-
-        # Per-source monthly counts (respect countries; each line for one source)
-        per_src_frames = []
-        if source_col and len(sources_for_lines) > 0:
-            for sname in sources_for_lines:
-                smask = base_mask.copy()
-                smask &= (cohort_now["_src_pick"] == sname)
+            # Per-source monthly lines honoring each source's country selection
+            per_src_frames = []
+            for src in active_sources(per_source_config):
+                # build mask for only this source using its chosen mode/countries
+                one_cfg = {src: per_source_config[src]}
+                smask = make_union_mask(cohort_now, one_cfg, use_key_sources)
                 s_cnt = cohort_now.loc[smask].groupby("_pay_m").size().rename("SelCnt").reset_index()
                 if s_cnt.empty:
                     continue
                 s_cnt["Month"] = s_cnt["_pay_m"].astype(str)
                 s_join = overall_m.merge(s_cnt[["_pay_m","SelCnt","Month"]], on=["_pay_m","Month"], how="left").fillna({"SelCnt":0})
                 s_join["PctOfOverall"] = np.where(s_join["TotalAll"]>0, s_join["SelCnt"]/s_join["TotalAll"]*100.0, 0.0)
-                s_join["Series"] = sname
+                s_join["Series"] = src
                 s_join = s_join[["Month","Series","SelCnt","TotalAll","PctOfOverall"]]
                 s_join["Month"] = pd.Categorical(s_join["Month"], categories=months_in_range, ordered=True)
                 per_src_frames.append(s_join)
 
-        if per_src_frames:
-            lines_df = pd.concat([all_line] + per_src_frames, ignore_index=True)
-        else:
-            lines_df = all_line.copy()
+            if per_src_frames:
+                lines_df = pd.concat([all_line] + per_src_frames, ignore_index=True)
+            else:
+                lines_df = all_line.copy()
 
-        # KPI: average of monthly "% of overall" for All Selected
-        avg_monthly_pct = lines_df.loc[lines_df["Series"]=="All Selected", "PctOfOverall"].mean() if not lines_df.empty else 0.0
-        st.markdown(
-            f"<div class='kpi-card'>"
-            f"<div class='kpi-title'>Month-wise: average % contribution (All Selected)</div>"
-            f"<div class='kpi-value'>{avg_monthly_pct:.1f}%</div>"
-            f"<div class='kpi-sub'>Months: {lines_df['Month'].nunique() if not lines_df.empty else 0}</div>"
-            f"</div>",
-            unsafe_allow_html=True,
-        )
-
-        # Multi-line month-wise chart (All Selected = thicker stroke)
-        stroke_width = alt.condition(
-            "datum.Series == 'All Selected'",
-            alt.value(4),
-            alt.value(2)
-        )
-        chart = alt.Chart(lines_df).mark_line(point=True).encode(
-            x=alt.X("Month:N", sort=months_in_range, title="Month"),
-            y=alt.Y("PctOfOverall:Q", title="% of overall business", scale=alt.Scale(domain=[0, 100])),
-            color=alt.Color("Series:N", title="Series"),
-            strokeWidth=stroke_width,
-            tooltip=[
-                alt.Tooltip("Month:N"),
-                alt.Tooltip("Series:N"),
-                alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
-                alt.Tooltip("TotalAll:Q", title="Total enrolments"),
-                alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f"),
-            ]
-        ).properties(height=360, title="Month-wise % of overall — All Selected vs each picked source")
-        st.altair_chart(chart, use_container_width=True)
-
-        # Month-wise table + download
-        with st.expander("Download: Month-wise selection contribution"):
-            view = lines_df.sort_values(["Series","Month"]).rename(
-                columns={
-                    "SelCnt":"Selected Enrolments",
-                    "TotalAll":"Total Enrolments",
-                    "PctOfOverall":"% of Overall"
-                }
+            avg_monthly_pct = lines_df.loc[lines_df["Series"]=="All Selected", "PctOfOverall"].mean() if not lines_df.empty else 0.0
+            st.markdown(
+                f"<div class='kpi-card'>"
+                f"<div class='kpi-title'>Month-wise: average % contribution (All Selected)</div>"
+                f"<div class='kpi-value'>{avg_monthly_pct:.1f}%</div>"
+                f"<div class='kpi-sub'>Months: {lines_df['Month'].nunique() if not lines_df.empty else 0}</div>"
+                f"</div>",
+                unsafe_allow_html=True,
             )
-            st.dataframe(view, use_container_width=True)
-            st.download_button(
-                "Download CSV – Month-wise selection (lines)",
-                data=view.to_csv(index=False).encode("utf-8"),
-                file_name="mix_selection_monthwise_lines.csv",
-                mime="text/csv"
-            )
+
+            stroke_width = alt.condition("datum.Series == 'All Selected'", alt.value(4), alt.value(2))
+            chart = alt.Chart(lines_df).mark_line(point=True).encode(
+                x=alt.X("Month:N", sort=months_in_range, title="Month"),
+                y=alt.Y("PctOfOverall:Q", title="% of overall business", scale=alt.Scale(domain=[0, 100])),
+                color=alt.Color("Series:N", title="Series"),
+                strokeWidth=stroke_width,
+                tooltip=[
+                    alt.Tooltip("Month:N"),
+                    alt.Tooltip("Series:N"),
+                    alt.Tooltip("SelCnt:Q", title="Enrolments (selected)"),
+                    alt.Tooltip("TotalAll:Q", title="Total enrolments"),
+                    alt.Tooltip("PctOfOverall:Q", title="% of overall", format=".1f"),
+                ]
+            ).properties(height=360, title="Month-wise % of overall — All Selected vs each picked source")
+            st.altair_chart(chart, use_container_width=True)
 
 # =========================
 # Deals vs Enrolments — for your current selection (grouped bars + optional Conversion line)
 # =========================
 st.markdown("### Deals vs Enrolments — for your current selection")
 
-def _mk_src_pick_column(d: pd.DataFrame) -> pd.Series:
-    if source_col and source_col in d.columns:
-        if 'use_key_sources' in locals() and use_key_sources:
-            return d[source_col].apply(normalize_key_source)
-        else:
-            return d[source_col].fillna("Unknown").astype(str)
-    return pd.Series("Other", index=d.index)
-
 def _build_created_paid_monthly(df_all: pd.DataFrame,
-                                start_d: date, end_d: date,
-                                picked_countries: list[str],
-                                sources_for_lines: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+                                start_d: date, end_d: date) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
+    df_all is already pre-filtered by (source × countries union).
     Returns:
       monthly_df: Month, CreatedCnt, PaidCnt, ConvPct
       agg_df: aggregate row with CreatedCnt, PaidCnt, ConvPct
     """
     d = df_all.copy()
-    d["_src_pick"] = _mk_src_pick_column(d)
     d["_cdate"] = d["_create_dt"].dt.date
     d["_pdate"] = d["_pay_dt"].dt.date
     d["_cmonth"] = d["_create_dt"].dt.to_period("M")
     d["_pmonth"] = d["_pay_dt"].dt.to_period("M")
-
-    # selection masks
-    sel_mask = pd.Series(True, index=d.index)
-    if country_col and 'picked_countries' in locals() and picked_countries:
-        sel_mask &= d[country_col].astype(str).isin(picked_countries)
-    if source_col and sources_for_lines:
-        sel_mask &= d["_src_pick"].isin(sources_for_lines)
 
     # window masks
     cwin = d["_cdate"].between(start_d, end_d)
     pwin = d["_pdate"].between(start_d, end_d)
 
     # calendar months in range
-    month_index = pd.period_range(start=start_d.replace(day=1),
-                                  end=end_d.replace(day=1),
-                                  freq="M")
+    month_index = pd.period_range(start=start_d.replace(day=1), end=end_d.replace(day=1), freq="M")
 
-    # monthly counts
     created_m = (
-        d.loc[sel_mask & cwin]
-          .groupby("_cmonth").size()
+        d.loc[cwin].groupby("_cmonth").size()
           .reindex(month_index, fill_value=0)
           .rename_axis(index="_month").reset_index(name="CreatedCnt")
     )
     paid_m = (
-        d.loc[sel_mask & pwin]
-          .groupby("_pmonth").size()
+        d.loc[pwin].groupby("_pmonth").size()
           .reindex(month_index, fill_value=0)
           .rename_axis(index="_month").reset_index(name="PaidCnt")
     )
@@ -681,7 +661,6 @@ def _build_created_paid_monthly(df_all: pd.DataFrame,
     monthly = created_m.merge(paid_m, on="_month", how="outer").fillna(0)
     monthly["Month"] = monthly["_month"].astype(str)
     monthly = monthly[["Month", "CreatedCnt", "PaidCnt"]]
-
     monthly["ConvPct"] = np.where(monthly["CreatedCnt"] > 0,
                                   monthly["PaidCnt"] / monthly["CreatedCnt"] * 100.0, 0.0)
 
@@ -692,23 +671,19 @@ def _build_created_paid_monthly(df_all: pd.DataFrame,
         "PaidCnt":    [total_paid],
         "ConvPct":    [float((total_paid / total_created * 100.0) if total_created > 0 else 0.0)]
     })
-
     return monthly, agg
 
-# ensure sources_for_lines exists
-if source_col:
-    try:
-        sources_for_lines  # noqa: F401
-    except NameError:
-        sources_for_lines = picked_srcs if picked_srcs else (src_options if source_col else [])
+# Apply the same union selection to df_clean for created & paid
+if picked_srcs:
+    union_mask_all = make_union_mask(df_clean, per_source_config, use_key_sources)
+else:
+    union_mask_all = pd.Series(False, index=df_clean.index)  # none selected -> empty
 
-monthly_sel, agg_sel = _build_created_paid_monthly(
-    df_clean, start_d, end_d,
-    picked_countries if 'picked_countries' in locals() else [],
-    sources_for_lines if 'sources_for_lines' in locals() else []
-)
+df_sel_all = df_clean.loc[union_mask_all].copy()
 
-# Aggregate KPIs
+monthly_sel, agg_sel = _build_created_paid_monthly(df_sel_all, start_d, end_d)
+
+# KPIs
 kpa, kpb, kpc = st.columns(3)
 with kpa:
     st.markdown(
@@ -731,43 +706,30 @@ with kpc:
 show_conv_line = st.checkbox("Overlay Conversion% line on bars", value=True, key="mix_conv_line")
 
 if not monthly_sel.empty:
-    # Long format for grouped bars
     bar_df = monthly_sel.melt(
         id_vars=["Month"],
         value_vars=["CreatedCnt", "PaidCnt"],
         var_name="Metric",
         value_name="Count"
     )
-    bar_df["Metric"] = bar_df["Metric"].map({
-        "CreatedCnt": "Deals Created",
-        "PaidCnt": "Enrolments"
-    })
+    bar_df["Metric"] = bar_df["Metric"].map({"CreatedCnt": "Deals Created", "PaidCnt": "Enrolments"})
 
-    # Grouped bars per month
     bars = alt.Chart(bar_df).mark_bar(opacity=0.9).encode(
         x=alt.X("Month:N", sort=monthly_sel["Month"].tolist(), title="Month"),
         y=alt.Y("Count:Q", title="Count"),
         color=alt.Color("Metric:N", title=""),
         xOffset=alt.XOffset("Metric:N"),
-        tooltip=[
-            alt.Tooltip("Month:N"),
-            alt.Tooltip("Metric:N"),
-            alt.Tooltip("Count:Q")
-        ]
+        tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Metric:N"), alt.Tooltip("Count:Q")]
     ).properties(height=360, title="Month-wise — Deals & Enrolments (bars)")
 
     if show_conv_line:
         line = alt.Chart(monthly_sel).mark_line(point=True).encode(
             x=alt.X("Month:N", sort=monthly_sel["Month"].tolist(), title="Month"),
             y=alt.Y("ConvPct:Q", title="Conversion%", axis=alt.Axis(orient="right")),
-            tooltip=[
-                alt.Tooltip("Month:N"),
-                alt.Tooltip("ConvPct:Q", title="Conversion%", format=".1f")
-            ],
+            tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("ConvPct:Q", title="Conversion%", format=".1f")],
             color=alt.value("#16a34a")
         )
-        combo = alt.layer(bars, line).resolve_scale(y='independent')
-        st.altair_chart(combo, use_container_width=True)
+        st.altair_chart(alt.layer(bars, line).resolve_scale(y='independent'), use_container_width=True)
     else:
         st.altair_chart(bars, use_container_width=True)
 
@@ -785,7 +747,7 @@ if not monthly_sel.empty:
             mime="text/csv"
         )
 else:
-    st.info("No month-wise data to plot for the current selection.")
+    st.info("No month-wise data to plot for the current selection. Pick at least one source in All/Specific.")
 
 # ----------------------------
 # Tables + Downloads
