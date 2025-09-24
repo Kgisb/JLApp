@@ -617,54 +617,53 @@ else:
             .groupby(source_col).size().rename("A").reset_index()
     )
 
+d_hist = d[d["_pay_m"] < cur_period].copy()
+rates_same, rates_prev, overall_same_rate, overall_prev_rate = daily_rates_from_lookback(
+    d_hist, source_col, lookback, weighted
+)
 
+elapsed_days = (today - cur_start).days + 1
+total_days   = (cur_end - cur_start).days + 1
+remaining_days = max(0, total_days - elapsed_days)
 
-    d_hist = d[d["_pay_m"] < cur_period].copy()
-    rates_same, rates_prev, overall_same_rate, overall_prev_rate = daily_rates_from_lookback(
-        d_hist, source_col, lookback, weighted
-    )
+src_realized = set(d_cur[source_col].fillna("Unknown").astype(str)) if not d_cur.empty else set()
+src_hist = set(list(rates_same.keys()) + list(rates_prev.keys()))
+all_sources = sorted(src_realized | src_hist | ({"All"} if source_col == "_Source" else set()))
 
-    elapsed_days = (today - cur_start).days + 1
-    total_days   = (cur_end - cur_start).days + 1
-    remaining_days = max(0, total_days - elapsed_days)
+A_tot = B_tot = C_tot = 0.0
+rows = []
+a_map = dict(zip(realized_by_src[source_col], realized_by_src["A"])) if not realized_by_src.empty else {}
 
-    src_realized = set(d_cur[source_col].dropna().astype(str)) if not d_cur.empty else set()
-    src_hist = set(list(rates_same.keys()) + list(rates_prev.keys()))
-    all_sources = sorted(src_realized | src_hist | ({"All"} if source_col == "_Source" else set()))
+for src in all_sources:
+    a_val = float(a_map.get(src, 0.0))
+    rate_same = rates_same.get(src, overall_same_rate)
+    rate_prev = rates_prev.get(src, overall_prev_rate)
 
-    A_tot = B_tot = C_tot = 0.0
-    rows = []
-    a_map = dict(zip(realized_by_src[source_col], realized_by_src["A"])) if not realized_by_src.empty else {}
+    b_val = float(rate_same * remaining_days)
+    c_val = float(rate_prev * remaining_days)
 
-    for src in all_sources:
-        a_val = float(a_map.get(src, 0.0))
-        rate_same = rates_same.get(src, overall_same_rate)
-        rate_prev = rates_prev.get(src, overall_prev_rate)
-
-        b_val = float(rate_same * remaining_days)
-        c_val = float(rate_prev * remaining_days)
-
-        rows.append({
-            "Source": src,
-            "A_Actual_ToDate": a_val,
-            "B_Remaining_SameMonth": b_val,
-            "C_Remaining_PrevMonths": c_val,
-            "Projected_MonthEnd_Total": a_val + b_val + c_val,
-            "Rate_Same_Daily": rate_same,
-            "Rate_Prev_Daily": rate_prev,
-            "Remaining_Days": remaining_days
-        })
-        A_tot += a_val; B_tot += b_val; C_tot += c_val
-
-    tbl = pd.DataFrame(rows).sort_values("Source").reset_index(drop=True)
-    totals = {
-        "A_Actual_ToDate": A_tot,
-        "B_Remaining_SameMonth": B_tot,
-        "C_Remaining_PrevMonths": C_tot,
-        "Projected_MonthEnd_Total": A_tot + B_tot + C_tot,
+    rows.append({
+        "Source": src,
+        "A_Actual_ToDate": a_val,
+        "B_Remaining_SameMonth": b_val,
+        "C_Remaining_PrevMonths": c_val,
+        "Projected_MonthEnd_Total": a_val + b_val + c_val,
+        "Rate_Same_Daily": rate_same,
+        "Rate_Prev_Daily": rate_prev,
         "Remaining_Days": remaining_days
-    }
-    return tbl, totals
+    })
+    A_tot += a_val; B_tot += b_val; C_tot += c_val
+
+tbl = pd.DataFrame(rows).sort_values("Source").reset_index(drop=True)
+totals = {
+    "A_Actual_ToDate": A_tot,
+    "B_Remaining_SameMonth": B_tot,
+    "C_Remaining_PrevMonths": C_tot,
+    "Projected_MonthEnd_Total": A_tot + B_tot + C_tot,
+    "Remaining_Days": remaining_days
+}
+return tbl, totals
+
 
 def predict_chart_stacked(tbl: pd.DataFrame):
     if tbl.empty:
