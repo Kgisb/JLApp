@@ -1,8 +1,10 @@
 # app_8020.py 
 # JetLearn: 80-20 Pareto + Trajectory + Conversion% + Mix Analyzer
-# Trajectory supports: Key buckets OR all raw sources, and "Deal Source for Top Countries".
-# FIX: safe categorical groupby when "All sources" is selected.
-# NEW: In Mix Analyzer > Specific mode, add "Any country (all)" option for each picked source.
+# Features:
+# - Trajectory: Key buckets OR all raw sources; "Deal Source for Top Countries".
+# - FIX: safe categorical groupby when "All sources" is selected.
+# - Mix Analyzer: "Any country (all)" inside Specific mode.
+# - NEW: Normalize JetLearn Deal Source to _src_raw (NaN -> "Unknown") and use it for sidebar filtering.
 
 import streamlit as st
 import pandas as pd
@@ -178,6 +180,12 @@ df_clean["_pay_dt"] = to_datetime(df_clean[pay_col])
 df_clean["_create_dt"] = to_datetime(df_clean[create_col]) if create_col else pd.NaT
 df_clean["_pay_m"] = df_clean["_pay_dt"].dt.to_period("M")
 
+# ---- NEW: normalize raw source once for consistent sidebar filtering
+if source_col:
+    df_clean["_src_raw"] = df_clean[source_col].fillna("Unknown").astype(str)
+else:
+    df_clean["_src_raw"] = "Other"
+
 # ----------------------------
 # Sidebar – Cohort date scope + Conversion%
 # ----------------------------
@@ -200,12 +208,16 @@ else:
         st.error("End date cannot be before start date.")
         st.stop()
 
-# Source filter (for the Pareto section only)
+# Sidebar Deal Source filter (for Pareto + Cohort views only) — uses _src_raw so "Unknown" is included
 if source_col:
-    all_sources = sorted(df_clean[source_col].dropna().astype(str).unique())
+    all_sources = sorted(df_clean["_src_raw"].unique().tolist())  # includes "Unknown"
     excl_ref = st.sidebar.checkbox("Exclude Referral (for Pareto view)", value=False)
     sources_for_pick = [s for s in all_sources if not (excl_ref and "referr" in s.lower())]
-    picked_sources = st.sidebar.multiselect("Include Deal Sources (Pareto)", options=sources_for_pick, default=sources_for_pick)
+    picked_sources = st.sidebar.multiselect(
+        "Include Deal Sources (Pareto)",
+        options=sources_for_pick,
+        default=sources_for_pick
+    )
 else:
     picked_sources = None
 
@@ -222,15 +234,17 @@ conv_mode = st.sidebar.radio(
 scope_mask = df_clean["_pay_dt"].dt.date.between(start_d, end_d)
 df_cohort = df_clean.loc[scope_mask].copy()
 if picked_sources is not None and source_col:
-    df_cohort = df_cohort[df_cohort[source_col].astype(str).isin(picked_sources)]
+    df_cohort = df_cohort[df_cohort["_src_raw"].isin(picked_sources)]  # consistent inclusion of Unknown
 
 # ----------------------------
-# Range KPI
+# Range KPI: Deals Created, Enrolments, Conversion%
 # ----------------------------
 in_create_window = df_clean["_create_dt"].dt.date.between(start_d, end_d)
 deals_created = int(in_create_window.sum())
+
 in_pay_window = df_clean["_pay_dt"].dt.date.between(start_d, end_d)
 enrolments = int(in_pay_window.sum())
+
 conv_pct_simple = (enrolments / deals_created * 100.0) if deals_created > 0 else 0.0
 
 st.markdown("<div class='section-title'>Range KPI — Deals Created vs Enrolments</div>", unsafe_allow_html=True)
@@ -273,7 +287,7 @@ with c2: st.altair_chart(donut_referral_share(df_cohort, source_col), use_contai
 st.altair_chart(pareto_chart(cty_tbl, "Country", "Pareto – Enrolments by Country"), use_container_width=True)
 
 # ----------------------------
-# Conversion% by Key Source (range-based)
+# Conversion% by Key Source (bar)
 # ----------------------------
 def conversion_stats(df_all: pd.DataFrame, start_d: date, end_d: date):
     if create_col is None or pay_col is None:
@@ -283,8 +297,8 @@ def conversion_stats(df_all: pd.DataFrame, start_d: date, end_d: date):
     d["_pdate"] = d["_pay_dt"].dt.date
     d["_key_source"] = d[source_col].apply(normalize_key_source) if source_col else "Other"
 
-    denom_mask = d["_cdate"].between(start_d, end_d)
-    num_mask = d["_pdate"].between(start_d, end_d)
+    denom_mask = d["_cdate"].between(start_d, end_d)  # deals created within range
+    num_mask = d["_pdate"].between(start_d, end_d)    # payments within range
 
     rows = []
     for src in ["Referral", "PM - Search", "PM - Social"]:
@@ -320,6 +334,7 @@ with col_t1:
 with col_t2:
     top_k = st.selectbox("Top countries (by cohort enrolments)", [5, 7], index=0)
 with col_tg:
+    # Grouping for this Trajectory section only
     traj_grouping = st.radio(
         "Source grouping",
         ["Key (Referral/PM-Search/PM-Social/Other)", "Raw (all)"],
@@ -378,10 +393,11 @@ if not mcs.empty:
     mcs = mcs.merge(monthly_total, on="_pay_m", how="left")
     mcs["PctOfOverall"] = np.where(mcs["TotalAll"]>0, mcs["Cnt"]/mcs["TotalAll"]*100.0, 0.0)
     mcs["_pay_m_str"] = pd.Categorical(mcs["_pay_m"].astype(str), categories=months_str, ordered=True)
-    # FIX: categorical -> safe groupby
+    # FIX: categorical -> safe groupby (remove unused levels)
     mcs["_pay_m_str"] = mcs["_pay_m_str"].cat.remove_unused_categories()
 
 if not mcs.empty:
+    # Sort legend by frequency
     src_order = mcs["_traj_source"].value_counts().index.tolist()
     title_suffix = f"{traj_src_pick}" if traj_src_pick != "All sources" else "All sources"
     grouping_suffix = "Key" if traj_grouping.startswith("Key") else "Raw"
@@ -402,9 +418,10 @@ if not mcs.empty:
     )
     st.altair_chart(facet_chart, use_container_width=True)
 
+    # Overall contribution lines (restricted to chosen top countries)
     overall = (
         mcs
-        .assign(_pay_m_str=mcs["_pay_m_str"].astype(str))
+        .assign(_pay_m_str=mcs["_pay_m_str"].astype(str))        # ensure plain string
         .groupby(["_pay_m_str","_traj_source"], observed=True, as_index=False)
         .agg(Cnt=("Cnt","sum"), TotalAll=("TotalAll","first"))
     )
@@ -464,32 +481,28 @@ else:
 def _mode_key(src): return f"src_mode::{src}"
 def _countries_key(src): return f"src_countries::{src}"
 
-# ---- NEW: constants for "Any country" sentinel
+# ---- "Any country" sentinel
 DISPLAY_ANY = "Any country (all)"
 
 # Build per-source country pickers
 per_source_config = {}  # src -> dict(mode, countries, available)
 
 for src in picked_srcs:
-    # countries where this source actually has enrolments in window
     available = (
         cohort_now.loc[cohort_now["_src_pick"] == src, country_col]
         .astype(str).fillna("Unknown").value_counts().index.tolist()
         if country_col and country_col in cohort_now.columns else []
     )
-    # init defaults in session_state
     if _mode_key(src) not in st.session_state:
         st.session_state[_mode_key(src)] = "All"
     if _countries_key(src) not in st.session_state:
         st.session_state[_countries_key(src)] = available.copy()
 
-    # reconcile if options changed (e.g., date/source change)
     if st.session_state[_mode_key(src)] == "Specific":
-        # keep previously selected countries that still exist; also keep DISPLAY_ANY if it was chosen
         prev = st.session_state[_countries_key(src)]
         st.session_state[_countries_key(src)] = [c for c in prev if (c in available) or (c == DISPLAY_ANY)]
         if not st.session_state[_countries_key(src)] and available:
-            st.session_state[_countries_key(src)] = available[:5]  # a small sensible default
+            st.session_state[_countries_key(src)] = available[:5]
 
     with st.container(border=True):
         c1, c2 = st.columns([1, 2])
@@ -504,7 +517,6 @@ for src in picked_srcs:
             )
         with c2:
             if mode == "Specific":
-                # NEW: include "Any country (all)" as a special option
                 options = [DISPLAY_ANY] + available
                 st.multiselect(
                     f"Countries for {src}",
@@ -546,7 +558,6 @@ def make_union_mask(df: pd.DataFrame, per_cfg: dict, use_key: bool) -> pd.Series
             chosen = set(info["countries"])
             if not chosen:
                 continue
-            # NEW: if "Any country (all)" selected, treat like All for this source
             if DISPLAY_ANY in chosen:
                 base = base | src_mask
             else:
@@ -741,7 +752,7 @@ with kpc:
         f"<div class='kpi-sub'>Num: {int(agg_sel['PaidCnt'].iloc[0]):,} • Den: {int(agg_sel['CreatedCnt'].iloc[0]):,}</div></div>",
         unsafe_allow_html=True)
 
-# ---- Month-wise chart
+# ---- Month-wise chart: Grouped bars + optional Conversion line
 show_conv_line = st.checkbox("Overlay Conversion% line on bars", value=True, key="mix_conv_line")
 
 if not monthly_sel.empty:
