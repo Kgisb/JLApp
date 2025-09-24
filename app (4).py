@@ -608,14 +608,15 @@ def predict_running_month(df_f: pd.DataFrame, create_col: str, pay_col: str, sou
     cur_period = pd.Period(today, freq="M")
 
     d_cur = d[d["_pay_m"] == cur_period].copy()
-    if d_cur.empty:
+if d_cur.empty:
     realized_by_src = pd.DataFrame(columns=[source_col, "A"])
-    else:
+else:
     # include Unknown deal source in Actual-to-date
-        realized_by_src = (
+    realized_by_src = (
         d_cur.assign(**{source_col: d_cur[source_col].fillna("Unknown").astype(str)})
             .groupby(source_col).size().rename("A").reset_index()
     )
+
 
 
     d_hist = d[d["_pay_m"] < cur_period].copy()
