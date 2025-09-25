@@ -1870,58 +1870,57 @@ elif view == "Stuck deals":
     )
 
     if scope_mode == "Month":
-    # Build month list from whatever date columns exist
-    candidates = []
-    if create_col:
-        candidates.append(coerce_datetime(df_f[create_col]))
-    if first_cal_sched_col and first_cal_sched_col in df_f.columns:
-        candidates.append(coerce_datetime(df_f[first_cal_sched_col]))
-    if cal_resched_col and cal_resched_col in df_f.columns:
-        candidates.append(coerce_datetime(df_f[cal_resched_col]))
-    if cal_done_col and cal_done_col in df_f.columns:
-        candidates.append(coerce_datetime(df_f[cal_done_col]))
-    if pay_col:
-        candidates.append(coerce_datetime(df_f[pay_col]))
+        # Build month list from whatever date columns exist
+        candidates = []
+        if create_col:
+            candidates.append(coerce_datetime(df_f[create_col]))
+        if first_cal_sched_col and first_cal_sched_col in df_f.columns:
+            candidates.append(coerce_datetime(df_f[first_cal_sched_col]))
+        if cal_resched_col and cal_resched_col in df_f.columns:
+            candidates.append(coerce_datetime(df_f[cal_resched_col]))
+        if cal_done_col and cal_done_col in df_f.columns:
+            candidates.append(coerce_datetime(df_f[cal_done_col]))
+        if pay_col:
+            candidates.append(coerce_datetime(df_f[pay_col]))
 
-    if candidates:
-        all_months = (
-            pd.to_datetime(pd.concat(candidates, ignore_index=True))
-              .dropna()
-              .dt.to_period("M")
-              .sort_values()
-              .unique()
-              .astype(str)
-              .tolist()
-        )
+        if candidates:
+            all_months = (
+                pd.to_datetime(pd.concat(candidates, ignore_index=True))
+                  .dropna()
+                  .dt.to_period("M")
+                  .sort_values()
+                  .unique()
+                  .astype(str)
+                  .tolist()
+            )
+        else:
+            all_months = []
+
+        if not all_months:
+            all_months = [str(pd.Period(date.today(), freq="M"))]
+
+        # Preselect running month if present; else fallback to last available month
+        running_period = str(pd.Period(date.today(), freq="M"))
+        default_idx = all_months.index(running_period) if running_period in all_months else len(all_months) - 1
+
+        sel_month = st.selectbox("Select month (YYYY-MM)", options=all_months, index=default_idx)
+        yy, mm = map(int, sel_month.split("-"))
+        range_start, range_end = month_bounds(date(yy, mm, 1))
+        st.caption(f"Scope: **{range_start} → {range_end}**")
+
     else:
-        all_months = []
-
-    if not all_months:
-        all_months = [str(pd.Period(date.today(), freq="M"))]
-
-    # Preselect running month if present; else fallback to last available month
-    running_period = str(pd.Period(date.today(), freq="M"))
-    default_idx = all_months.index(running_period) if running_period in all_months else len(all_months) - 1
-
-    sel_month = st.selectbox("Select month (YYYY-MM)", options=all_months, index=default_idx)
-    yy, mm = map(int, sel_month.split("-"))
-    range_start, range_end = month_bounds(date(yy, mm, 1))
-    st.caption(f"Scope: **{range_start} → {range_end}**")
-
-else:
-    trailing = st.slider("Trailing window (days)", min_value=7, max_value=60, value=15, step=1)
-    range_end = date.today()
-    range_start = range_end - timedelta(days=trailing - 1)
-    st.caption(f"Scope: **{range_start} → {range_end}** (last {trailing} days)")
-
+        trailing = st.slider("Trailing window (days)", min_value=7, max_value=60, value=15, step=1)
+        range_end = date.today()
+        range_start = range_end - timedelta(days=trailing - 1)
+        st.caption(f"Scope: **{range_start} → {range_end}** (last {trailing} days)")
 
     # ==== Prepare normalized datetime columns from FILTERED data
     d = df_f.copy()
-    d["_c"] = coerce_datetime(d[create_col]) if create_col else pd.Series(pd.NaT, index=d.index)
-    d["_f"] = coerce_datetime(d[first_cal_sched_col]) if first_cal_sched_col and first_cal_sched_col in d.columns else pd.Series(pd.NaT, index=d.index)
-    d["_r"] = coerce_datetime(d[cal_resched_col]) if cal_resched_col and cal_resched_col in d.columns else pd.Series(pd.NaT, index=d.index)
-    d["_fd"] = coerce_datetime(d[cal_done_col]) if cal_done_col and cal_done_col in d.columns else pd.Series(pd.NaT, index=d.index)
-    d["_p"] = coerce_datetime(d[pay_col]) if pay_col else pd.Series(pd.NaT, index=d.index)
+    d["_c"]  = coerce_datetime(d[create_col]) if create_col else pd.Series(pd.NaT, index=d.index)
+    d["_f"]  = coerce_datetime(d[first_cal_sched_col]) if first_cal_sched_col and first_cal_sched_col in d.columns else pd.Series(pd.NaT, index=d.index)
+    d["_r"]  = coerce_datetime(d[cal_resched_col])     if cal_resched_col and cal_resched_col in d.columns     else pd.Series(pd.NaT, index=d.index)
+    d["_fd"] = coerce_datetime(d[cal_done_col])        if cal_done_col and cal_done_col in d.columns          else pd.Series(pd.NaT, index=d.index)
+    d["_p"]  = coerce_datetime(d[pay_col]) if pay_col else pd.Series(pd.NaT, index=d.index)
 
     # Effective trial date = min(First Cal, Rescheduled), NaT-safe
     d["_trial"] = d[["_f", "_r"]].min(axis=1, skipna=True)
@@ -1973,10 +1972,10 @@ else:
 
     # ==== Funnel summary (avoid % sign in column names to keep Altair happy)
     funnel_rows = [
-        {"Stage": "Created (T)",           "Count": total_created, "FromPrev_pct": 100.0},
-        {"Stage": "Trial (First/Resched)", "Count": total_trial,   "FromPrev_pct": (total_trial / total_created * 100.0) if total_created > 0 else 0.0},
-        {"Stage": "Calibration Done",      "Count": total_caldone, "FromPrev_pct": (total_caldone / total_trial * 100.0) if total_trial > 0 else 0.0},
-        {"Stage": "Payment Received",      "Count": total_pay,     "FromPrev_pct": (total_pay / total_caldone * 100.0) if total_caldone > 0 else 0.0},
+        {"Stage": "Created (T)",            "Count": total_created, "FromPrev_pct": 100.0},
+        {"Stage": "Trial (First/Resched)",  "Count": total_trial,   "FromPrev_pct": (total_trial / total_created * 100.0) if total_created > 0 else 0.0},
+        {"Stage": "Calibration Done",       "Count": total_caldone, "FromPrev_pct": (total_caldone / total_trial * 100.0) if total_trial > 0 else 0.0},
+        {"Stage": "Payment Received",       "Count": total_pay,     "FromPrev_pct": (total_pay / total_caldone * 100.0) if total_caldone > 0 else 0.0},
     ]
     funnel_df = pd.DataFrame(funnel_rows)
 
