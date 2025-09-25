@@ -1879,7 +1879,10 @@ elif view == "Stuck deals":
         if pay_col: candidates.append(coerce_datetime(df_f[pay_col]))
 
         if candidates:
-            all_months = pd.to_datetime(pd.concat(candidates, ignore_index=True)).dropna().dt.to_period("M").sort_values().unique().astype(str).tolist()
+            all_months = (
+                pd.to_datetime(pd.concat(candidates, ignore_index=True))
+                  .dropna().dt.to_period("M").sort_values().unique().astype(str).tolist()
+            )
         else:
             all_months = []
 
@@ -1907,39 +1910,30 @@ elif view == "Stuck deals":
     # Effective trial date = min(First Cal, Rescheduled), NaT-safe
     d["_trial"] = d[["_f", "_r"]].min(axis=1, skipna=True)
 
-    # ==== Filter: Calibration Slot (Deal) — Pre-Book / Sales Book Trial / Both / None
-def _tag_cal_slot(val: object) -> str:
-    if pd.isna(val):
-        return "None/Blank"
-    v = str(val).strip().lower()
-    if v == "" or v == "nan":
-        return "None/Blank"
-    # heuristics: look for the phrases
-    has_pre  = ("pre" in v) and ("book" in v)
-    has_sbt  = (("sales" in v) or ("sale" in v)) and ("book" in v) and ("trial" in v)
-    if has_pre and has_sbt:
-        return "Both"
-    if has_pre:
-        return "Pre-Book"
-    if has_sbt:
-        return "Sales Book Trial"
-    return "Other"
+    # ==== Filter: Booking type (Pre-Book vs Self-Book) based on Trial + Slot
+    # Rule:
+    #   Pre-Book  = has a Trial date AND Calibration Slot (Deal) is non-empty
+    #   Self-Book = everything else (no trial OR empty slot)
+    if 'calibration_slot_col' in locals() and calibration_slot_col and calibration_slot_col in d.columns:
+        slot_series = d[calibration_slot_col].astype(str)
+        _s = slot_series.str.strip().str.lower()
+        has_slot = _s.ne("") & _s.ne("nan") & _s.ne("none")
 
-if calibration_slot_col and calibration_slot_col in d.columns:
-    d["_slot_tag"] = d[calibration_slot_col].apply(_tag_cal_slot)
-    slot_options = ["All", "Pre-Book", "Sales Book Trial", "Both", "None/Blank", "Other"]
-    pick_slots = st.multiselect(
-        "Filter • Calibration Slot (Deal)",
-        options=slot_options,
-        default=["All"],
-        help="Show only deals whose Calibration Slot (Deal) is tagged as Pre-Book, Sales Book Trial, Both, None/Blank, or Other."
-    )
-    if "All" not in pick_slots:
-        d = d[d["_slot_tag"].isin(pick_slots)].copy()
-        st.caption(f"Calibration Slot filter applied: {', '.join(pick_slots)} • Rows now: {len(d):,}")
-else:
-    st.info("Calibration Slot (Deal) column not found — slot filter not applied.")
+        is_prebook = d["_trial"].notna() & has_slot
+        d["_booking_type"] = np.where(is_prebook, "Pre-Book", "Self-Book")
 
+        booking_choice = st.radio(
+            "Booking type",
+            options=["All", "Pre-Book", "Self-Book"],
+            index=0,
+            horizontal=True,
+            help="Pre-Book = Trial present AND slot filled. Self-Book = otherwise."
+        )
+        if booking_choice != "All":
+            d = d[d["_booking_type"] == booking_choice].copy()
+            st.caption(f"Booking type filter: **{booking_choice}** • Rows now: **{len(d):,}**")
+    else:
+        st.info("Calibration Slot (Deal) column not found — booking type filter not applied.")
 
     # ==== Cohort: deals CREATED within scope
     mask_created = d["_c"].dt.date.between(range_start, range_end)
@@ -1963,10 +1957,10 @@ else:
 
     # ==== Funnel summary (avoid % sign in column names to keep Altair happy)
     funnel_rows = [
-        {"Stage":"Created (T)",           "Count": total_created, "FromPrev_pct": 100.0},
-        {"Stage":"Trial (First/Resched)","Count": total_trial,   "FromPrev_pct": (total_trial/total_created*100.0) if total_created>0 else 0.0},
-        {"Stage":"Calibration Done",     "Count": total_caldone, "FromPrev_pct": (total_caldone/total_trial*100.0) if total_trial>0 else 0.0},
-        {"Stage":"Payment Received",     "Count": total_pay,     "FromPrev_pct": (total_pay/total_caldone*100.0) if total_caldone>0 else 0.0},
+        {"Stage":"Created (T)",            "Count": total_created, "FromPrev_pct": 100.0},
+        {"Stage":"Trial (First/Resched)", "Count": total_trial,   "FromPrev_pct": (total_trial/total_created*100.0) if total_created>0 else 0.0},
+        {"Stage":"Calibration Done",      "Count": total_caldone, "FromPrev_pct": (total_caldone/total_trial*100.0) if total_trial>0 else 0.0},
+        {"Stage":"Payment Received",      "Count": total_pay,     "FromPrev_pct": (total_pay/total_caldone*100.0) if total_caldone>0 else 0.0},
     ]
     funnel_df = pd.DataFrame(funnel_rows)
 
@@ -2096,3 +2090,4 @@ else:
                 file_name="stuck_deals_mom_funnel_propagation.csv",
                 mime="text/csv"
             )
+
