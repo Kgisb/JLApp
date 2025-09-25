@@ -1860,9 +1860,9 @@ elif view == "Stuck deals":
             icon="⚠️"
         )
 
-    # If you didn't already define this earlier, try to find the Slot column now
-    if "calibration_slot_col" not in locals() or not calibration_slot_col or calibration_slot_col not in df.columns:
-        calibration_slot_col = find_col(df, [
+    # Try to find the Slot column if not already mapped
+    if ("calibration_slot_col" not in locals()) or (not calibration_slot_col) or (calibration_slot_col not in df_f.columns):
+        calibration_slot_col = find_col(df_f, [
             "Calibration Slot (Deal)", "Calibration Slot", "Book Slot", "Trial Slot"
         ])
 
@@ -1899,7 +1899,10 @@ elif view == "Stuck deals":
                   .astype(str)
                   .tolist()
             )
-    
+        else:
+            all_months = []
+
+        # Ensure at least the running month is present
         if not all_months:
             all_months = [str(pd.Period(date.today(), freq="M"))]
 
