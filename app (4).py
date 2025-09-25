@@ -1900,7 +1900,7 @@ elif view == "Stuck deals":
             all_months = [str(pd.Period(date.today(), freq="M"))]
 
         # Preselect the running month if present; else fallback to the last available month
-        running_period = str(pd.Period(date.today(), freq="M"))
+            running_period = str(pd.Period(date.today(), freq="M"))
         if running_period in all_months:
             default_idx = all_months.index(running_period)
         else:
