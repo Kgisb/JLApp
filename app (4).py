@@ -1899,7 +1899,7 @@ elif view == "Stuck deals":
                   .astype(str)
                   .tolist()
             )
-        else:
+    else:
         all_months = []
 
         if not all_months:
