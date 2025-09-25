@@ -1839,3 +1839,281 @@ elif view == "80-20":
         else:
             st.info("No conversion table for the current selection.")
 
+elif view == "Stuck deals":
+    st.subheader("Stuck deals – Funnel & Propagation (Created → Trial → Cal Done → Payment)")
+
+    # ==== Column presence (warn but never stop)
+    missing_cols = []
+    for col_label, col_var in [
+        ("Create Date", create_col),
+        ("First Calibration Scheduled Date", first_cal_sched_col),
+        ("Calibration Rescheduled Date", cal_resched_col),
+        ("Calibration Done Date", cal_done_col),
+        ("Payment Received Date", pay_col),
+    ]:
+        if not col_var or col_var not in df_f.columns:
+            missing_cols.append(col_label)
+    if missing_cols:
+        st.warning(
+            "Missing columns: " + ", ".join(missing_cols) +
+            ". Funnel/metrics will skip the missing stages where applicable.",
+            icon="⚠️"
+        )
+
+    # ==== Scope controls
+    scope_mode = st.radio(
+        "Scope",
+        ["Month", "Trailing days"],
+        horizontal=True,
+        index=0,
+        help="Month = a single calendar month. Trailing days = rolling window ending today."
+    )
+
+    if scope_mode == "Month":
+        # Build month list from whatever date columns exist
+        candidates = []
+        if create_col:
+            candidates.append(coerce_datetime(df_f[create_col]))
+        if first_cal_sched_col and first_cal_sched_col in df_f.columns:
+            candidates.append(coerce_datetime(df_f[first_cal_sched_col]))
+        if cal_resched_col and cal_resched_col in df_f.columns:
+            candidates.append(coerce_datetime(df_f[cal_resched_col]))
+        if cal_done_col and cal_done_col in df_f.columns:
+            candidates.append(coerce_datetime(df_f[cal_done_col]))
+        if pay_col:
+            candidates.append(coerce_datetime(df_f[pay_col]))
+
+        if candidates:
+            all_months = (
+                pd.to_datetime(pd.concat(candidates, ignore_index=True))
+                  .dropna()
+                  .dt.to_period("M")
+                  .sort_values()
+                  .unique()
+                  .astype(str)
+                  .tolist()
+            )
+        else:
+            all_months = []
+
+        if not all_months:
+            all_months = [str(pd.Period(date.today(), freq="M"))]
+
+        # Preselect running month if present; else fallback to last available month
+        running_period = str(pd.Period(date.today(), freq="M"))
+        default_idx = all_months.index(running_period) if running_period in all_months else len(all_months) - 1
+
+        sel_month = st.selectbox("Select month (YYYY-MM)", options=all_months, index=default_idx)
+        yy, mm = map(int, sel_month.split("-"))
+        range_start, range_end = month_bounds(date(yy, mm, 1))
+        st.caption(f"Scope: **{range_start} → {range_end}**")
+
+    else:
+        trailing = st.slider("Trailing window (days)", min_value=7, max_value=60, value=15, step=1)
+        range_end = date.today()
+        range_start = range_end - timedelta(days=trailing - 1)
+        st.caption(f"Scope: **{range_start} → {range_end}** (last {trailing} days)")
+
+    # ==== Prepare normalized datetime columns from FILTERED data
+    d = df_f.copy()
+    d["_c"]  = coerce_datetime(d[create_col]) if create_col else pd.Series(pd.NaT, index=d.index)
+    d["_f"]  = coerce_datetime(d[first_cal_sched_col]) if first_cal_sched_col and first_cal_sched_col in d.columns else pd.Series(pd.NaT, index=d.index)
+    d["_r"]  = coerce_datetime(d[cal_resched_col])     if cal_resched_col and cal_resched_col in d.columns     else pd.Series(pd.NaT, index=d.index)
+    d["_fd"] = coerce_datetime(d[cal_done_col])        if cal_done_col and cal_done_col in d.columns          else pd.Series(pd.NaT, index=d.index)
+    d["_p"]  = coerce_datetime(d[pay_col]) if pay_col else pd.Series(pd.NaT, index=d.index)
+
+    # Effective trial date = min(First Cal, Rescheduled), NaT-safe
+    d["_trial"] = d[["_f", "_r"]].min(axis=1, skipna=True)
+
+    # ==== Filter: Booking type (Pre-Book vs Self-Book) based on Trial + Slot
+    # Rule:
+    #   Pre-Book  = has a Trial date AND Calibration Slot (Deal) is non-empty
+    #   Self-Book = everything else (no trial OR empty slot)
+    if 'calibration_slot_col' in locals() and calibration_slot_col and calibration_slot_col in d.columns:
+        slot_series = d[calibration_slot_col].astype(str)
+        _s = slot_series.str.strip().str.lower()
+        has_slot = _s.ne("") & _s.ne("nan") & _s.ne("none")
+
+        is_prebook = d["_trial"].notna() & has_slot
+        d["_booking_type"] = np.where(is_prebook, "Pre-Book", "Self-Book")
+
+        booking_choice = st.radio(
+            "Booking type",
+            options=["All", "Pre-Book", "Self-Book"],
+            index=0,
+            horizontal=True,
+            help="Pre-Book = Trial present AND slot filled. Self-Book = otherwise."
+        )
+        if booking_choice != "All":
+            d = d[d["_booking_type"] == booking_choice].copy()
+            st.caption(f"Booking type filter: **{booking_choice}** • Rows now: **{len(d):,}**")
+    else:
+        st.info("Calibration Slot (Deal) column not found — booking type filter not applied.")
+
+    # ==== Cohort: deals CREATED within scope
+    mask_created = d["_c"].dt.date.between(range_start, range_end)
+    cohort = d.loc[mask_created].copy()
+    total_created = int(len(cohort))
+
+    # Stage 2: Trial in SAME scope & same cohort
+    trial_mask = cohort["_trial"].dt.date.between(range_start, range_end)
+    trial_df = cohort.loc[trial_mask].copy()
+    total_trial = int(len(trial_df))
+
+    # Stage 3: Cal Done in SAME scope from those that had Trial in scope
+    caldone_mask = trial_df["_fd"].dt.date.between(range_start, range_end)
+    caldone_df = trial_df.loc[caldone_mask].copy()
+    total_caldone = int(len(caldone_df))
+
+    # Stage 4: Payment in SAME scope from those that had Cal Done in scope
+    pay_mask = caldone_df["_p"].dt.date.between(range_start, range_end)
+    pay_df = caldone_df.loc[pay_mask].copy()
+    total_pay = int(len(pay_df))
+
+    # ==== Funnel summary (avoid % sign in column names to keep Altair happy)
+    funnel_rows = [
+        {"Stage": "Created (T)",            "Count": total_created, "FromPrev_pct": 100.0},
+        {"Stage": "Trial (First/Resched)",  "Count": total_trial,   "FromPrev_pct": (total_trial / total_created * 100.0) if total_created > 0 else 0.0},
+        {"Stage": "Calibration Done",       "Count": total_caldone, "FromPrev_pct": (total_caldone / total_trial * 100.0) if total_trial > 0 else 0.0},
+        {"Stage": "Payment Received",       "Count": total_pay,     "FromPrev_pct": (total_pay / total_caldone * 100.0) if total_caldone > 0 else 0.0},
+    ]
+    funnel_df = pd.DataFrame(funnel_rows)
+
+    # Always show something (even when all zeros)
+    bar = alt.Chart(funnel_df).mark_bar(opacity=0.9).encode(
+        x=alt.X("Count:Q", title="Count"),
+        y=alt.Y("Stage:N", sort=list(funnel_df["Stage"])[::-1], title=""),
+        tooltip=[
+            alt.Tooltip("Stage:N"),
+            alt.Tooltip("Count:Q"),
+            alt.Tooltip("FromPrev_pct:Q", title="% from previous", format=".1f"),
+        ],
+        color=alt.Color("Stage:N", legend=None),
+    ).properties(height=240, title="Funnel (same cohort within scope)")
+    txt = alt.Chart(funnel_df).mark_text(align="left", dx=5).encode(
+        x="Count:Q",
+        y=alt.Y("Stage:N", sort=list(funnel_df["Stage"])[::-1]),
+        text=alt.Text("Count:Q"),
+    )
+    st.altair_chart(bar + txt, use_container_width=True)
+
+    # Quick debug line so you can see data even if bars look empty
+    st.caption(
+        f"Created: {total_created} • Trial: {total_trial} • Cal Done: {total_caldone} • Payments: {total_pay}"
+    )
+
+    # ==== Propagation (average days) – computed only on the same filtered sets
+    def avg_days(src_series, dst_series) -> float:
+        s = (dst_series - src_series).dt.days
+        s = s.dropna()
+        return float(s.mean()) if len(s) else np.nan
+
+    avg_ct = avg_days(trial_df["_c"], trial_df["_trial"]) if not trial_df.empty else np.nan
+    avg_tc = avg_days(caldone_df["_trial"], caldone_df["_fd"]) if not caldone_df.empty else np.nan
+    avg_dp = avg_days(pay_df["_fd"], pay_df["_p"]) if not pay_df.empty else np.nan
+
+    def fmtd(x): return "–" if pd.isna(x) else f"{x:.1f} days"
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        st.markdown(
+            f"<div class='kpi-card'><div class='kpi-title'>Created → Trial</div><div class='kpi-value'>{fmtd(avg_ct)}</div></div>",
+            unsafe_allow_html=True
+        )
+    with g2:
+        st.markdown(
+            f"<div class='kpi-card'><div class='kpi-title'>Trial → Cal Done</div><div class='kpi-value'>{fmtd(avg_tc)}</div></div>",
+            unsafe_allow_html=True
+        )
+    with g3:
+        st.markdown(
+            f"<div class='kpi-card'><div class='kpi-title'>Cal Done → Payment</div><div class='kpi-value'>{fmtd(avg_dp)}</div></div>",
+            unsafe_allow_html=True
+        )
+
+    # ==== Month-on-Month comparison
+    st.markdown("### Month-on-Month comparison")
+    compare_k = st.slider("Compare last N months (ending at selected month or current)", 2, 12, 6, step=1)
+
+    # Decide anchor month
+    anchor_day = range_end if scope_mode == "Month" else date.today()
+    months = months_back_list(anchor_day, compare_k)  # returns list of monthly Periods
+
+    def month_funnel(m_period: pd.Period):
+        ms = date(m_period.year, m_period.month, 1)
+        me = date(m_period.year, m_period.month, monthrange(m_period.year, m_period.month)[1])
+
+        coh = d[d["_c"].dt.date.between(ms, me)].copy()
+        ct = int(len(coh))
+
+        tr_mask = coh["_trial"].dt.date.between(ms, me)
+        coh_tr = coh.loc[tr_mask].copy()
+        tr = int(len(coh_tr))
+
+        cd_mask = coh_tr["_fd"].dt.date.between(ms, me)
+        coh_cd = coh_tr.loc[cd_mask].copy()
+        cd = int(len(coh_cd))
+
+        py = int(coh_cd["_p"].dt.date.between(ms, me).sum())
+
+        # propagation avgs
+        avg1 = avg_days(coh_tr["_c"], coh_tr["_trial"]) if not coh_tr.empty else np.nan
+        avg2 = avg_days(coh_cd["_trial"], coh_cd["_fd"]) if not coh_cd.empty else np.nan
+        avg3 = avg_days(coh_cd["_fd"], coh_cd["_p"]) if not coh_cd.empty else np.nan
+
+        return {
+            "Month": str(m_period),
+            "Created": ct,
+            "Trial": tr,
+            "CalDone": cd,
+            "Paid": py,
+            "Trial_from_Created_pct": (tr / ct * 100.0) if ct > 0 else 0.0,
+            "CalDone_from_Trial_pct": (cd / tr * 100.0) if tr > 0 else 0.0,
+            "Paid_from_CalDone_pct": (py / cd * 100.0) if cd > 0 else 0.0,
+            "Avg_Created_to_Trial_days": avg1,
+            "Avg_Trial_to_CalDone_days": avg2,
+            "Avg_CalDone_to_Payment_days": avg3,
+        }
+
+    mom_tbl = pd.DataFrame([month_funnel(m) for m in months])
+
+    if mom_tbl.empty:
+        st.info("Not enough historical data to build month-on-month comparison.")
+    else:
+        # Conversion step lines
+        conv_long = mom_tbl.melt(
+            id_vars=["Month"],
+            value_vars=["Trial_from_Created_pct", "CalDone_from_Trial_pct", "Paid_from_CalDone_pct"],
+            var_name="Step",
+            value_name="Pct",
+        )
+        conv_chart = alt.Chart(conv_long).mark_line(point=True).encode(
+            x=alt.X("Month:N", sort=mom_tbl["Month"].tolist()),
+            y=alt.Y("Pct:Q", title="Step conversion %", scale=alt.Scale(domain=[0, 100])),
+            color=alt.Color("Step:N", title="Step"),
+            tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Step:N"), alt.Tooltip("Pct:Q", format=".1f")],
+        ).properties(height=320, title="Step conversion% (MoM)")
+        st.altair_chart(conv_chart, use_container_width=True)
+
+        # Propagation lines
+        lag_long = mom_tbl.melt(
+            id_vars=["Month"],
+            value_vars=["Avg_Created_to_Trial_days", "Avg_Trial_to_CalDone_days", "Avg_CalDone_to_Payment_days"],
+            var_name="Lag",
+            value_name="Days",
+        )
+        lag_chart = alt.Chart(lag_long).mark_line(point=True).encode(
+            x=alt.X("Month:N", sort=mom_tbl["Month"].tolist()),
+            y=alt.Y("Days:Q", title="Avg days"),
+            color=alt.Color("Lag:N", title="Propagation"),
+            tooltip=[alt.Tooltip("Month:N"), alt.Tooltip("Lag:N"), alt.Tooltip("Days:Q", format=".1f")],
+        ).properties(height=320, title="Average propagation (MoM)")
+        st.altair_chart(lag_chart, use_container_width=True)
+
+        with st.expander("Month-on-Month table"):
+            st.dataframe(mom_tbl, use_container_width=True)
+            st.download_button(
+                "Download CSV – MoM Funnel & Propagation",
+                data=mom_tbl.to_csv(index=False).encode("utf-8"),
+                file_name="stuck_deals_mom_funnel_propagation.csv",
+                mime="text/csv",
+            )
