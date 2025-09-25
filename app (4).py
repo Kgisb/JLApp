@@ -1860,18 +1860,11 @@ elif view == "Stuck deals":
             icon="⚠️"
         )
 
-    # Ensure we have a pointer to the Slot column (if you haven't set it earlier)
-    if "calibration_slot_col" not in locals():
-        calibration_slot_col = find_col(
-            df,  # or df_f; we just need the column name
-            [
-                "Calibration Slot (Deal)",
-                "Calibration Slot",
-                "Book Slot",
-                "Booking Slot",
-                "Trial Slot",
-            ]
-        )
+    # If you didn't already define this earlier, try to find the Slot column now
+    if "calibration_slot_col" not in locals() or not calibration_slot_col or calibration_slot_col not in df.columns:
+        calibration_slot_col = find_col(df, [
+            "Calibration Slot (Deal)", "Calibration Slot", "Book Slot", "Trial Slot"
+        ])
 
     # ==== Scope controls
     scope_mode = st.radio(
@@ -1899,12 +1892,12 @@ elif view == "Stuck deals":
         if candidates:
             all_months = (
                 pd.to_datetime(pd.concat(candidates, ignore_index=True))
-                .dropna()
-                .dt.to_period("M")
-                .sort_values()
-                .unique()
-                .astype(str)
-                .tolist()
+                  .dropna()
+                  .dt.to_period("M")
+                  .sort_values()
+                  .unique()
+                  .astype(str)
+                  .tolist()
             )
         else:
             all_months = []
@@ -1920,7 +1913,6 @@ elif view == "Stuck deals":
         yy, mm = map(int, sel_month.split("-"))
         range_start, range_end = month_bounds(date(yy, mm, 1))
         st.caption(f"Scope: **{range_start} → {range_end}**")
-
     else:
         trailing = st.slider("Trailing window (days)", min_value=7, max_value=60, value=15, step=1)
         range_end = date.today()
@@ -2025,9 +2017,7 @@ elif view == "Stuck deals":
     avg_tc = avg_days(caldone_df["_trial"], caldone_df["_fd"]) if not caldone_df.empty else np.nan
     avg_dp = avg_days(pay_df["_fd"], pay_df["_p"]) if not pay_df.empty else np.nan
 
-    def fmtd(x): 
-        return "–" if pd.isna(x) else f"{x:.1f} days"
-
+    def fmtd(x): return "–" if pd.isna(x) else f"{x:.1f} days"
     g1, g2, g3 = st.columns(3)
     with g1:
         st.markdown(
