@@ -1899,12 +1899,9 @@ elif view == "Stuck deals":
         if not all_months:
             all_months = [str(pd.Period(date.today(), freq="M"))]
 
-        # Preselect the running month if present; else fallback to the last available month
-            running_period = str(pd.Period(date.today(), freq="M"))
-        if running_period in all_months:
-            default_idx = all_months.index(running_period)
-        else:
-            default_idx = len(all_months) - 1
+        # Preselect running month if present; else fallback to last available month
+        running_period = str(pd.Period(date.today(), freq="M"))
+        default_idx = all_months.index(running_period) if running_period in all_months else len(all_months) - 1
 
         sel_month = st.selectbox("Select month (YYYY-MM)", options=all_months, index=default_idx)
         yy, mm = map(int, sel_month.split("-"))
@@ -1919,11 +1916,11 @@ elif view == "Stuck deals":
 
     # ==== Prepare normalized datetime columns from FILTERED data
     d = df_f.copy()
-    d["_c"]  = coerce_datetime(d[create_col]) if create_col else pd.Series(pd.NaT, index=d.index)
-    d["_f"]  = coerce_datetime(d[first_cal_sched_col]) if first_cal_sched_col and first_cal_sched_col in d.columns else pd.Series(pd.NaT, index=d.index)
-    d["_r"]  = coerce_datetime(d[cal_resched_col])     if cal_resched_col and cal_resched_col in d.columns     else pd.Series(pd.NaT, index=d.index)
-    d["_fd"] = coerce_datetime(d[cal_done_col])        if cal_done_col and cal_done_col in d.columns          else pd.Series(pd.NaT, index=d.index)
-    d["_p"]  = coerce_datetime(d[pay_col]) if pay_col else pd.Series(pd.NaT, index=d.index)
+    d["_c"] = coerce_datetime(d[create_col]) if create_col else pd.Series(pd.NaT, index=d.index)
+    d["_f"] = coerce_datetime(d[first_cal_sched_col]) if first_cal_sched_col and first_cal_sched_col in d.columns else pd.Series(pd.NaT, index=d.index)
+    d["_r"] = coerce_datetime(d[cal_resched_col]) if cal_resched_col and cal_resched_col in d.columns else pd.Series(pd.NaT, index=d.index)
+    d["_fd"] = coerce_datetime(d[cal_done_col]) if cal_done_col and cal_done_col in d.columns else pd.Series(pd.NaT, index=d.index)
+    d["_p"] = coerce_datetime(d[pay_col]) if pay_col else pd.Series(pd.NaT, index=d.index)
 
     # Effective trial date = min(First Cal, Rescheduled), NaT-safe
     d["_trial"] = d[["_f", "_r"]].min(axis=1, skipna=True)
@@ -1932,7 +1929,7 @@ elif view == "Stuck deals":
     # Rule:
     #   Pre-Book  = has a Trial date AND Calibration Slot (Deal) is non-empty
     #   Self-Book = everything else (no trial OR empty slot)
-    if calibration_slot_col and calibration_slot_col in d.columns:
+    if 'calibration_slot_col' in locals() and calibration_slot_col and calibration_slot_col in d.columns:
         slot_series = d[calibration_slot_col].astype(str)
         _s = slot_series.str.strip().str.lower()
         has_slot = _s.ne("") & _s.ne("nan") & _s.ne("none")
@@ -1975,10 +1972,10 @@ elif view == "Stuck deals":
 
     # ==== Funnel summary (avoid % sign in column names to keep Altair happy)
     funnel_rows = [
-        {"Stage": "Created (T)",            "Count": total_created, "FromPrev_pct": 100.0},
-        {"Stage": "Trial (First/Resched)",  "Count": total_trial,   "FromPrev_pct": (total_trial/total_created*100.0) if total_created > 0 else 0.0},
-        {"Stage": "Calibration Done",       "Count": total_caldone, "FromPrev_pct": (total_caldone/total_trial*100.0) if total_trial > 0 else 0.0},
-        {"Stage": "Payment Received",       "Count": total_pay,     "FromPrev_pct": (total_pay/total_caldone*100.0) if total_caldone > 0 else 0.0},
+        {"Stage": "Created (T)",           "Count": total_created, "FromPrev_pct": 100.0},
+        {"Stage": "Trial (First/Resched)", "Count": total_trial,   "FromPrev_pct": (total_trial / total_created * 100.0) if total_created > 0 else 0.0},
+        {"Stage": "Calibration Done",      "Count": total_caldone, "FromPrev_pct": (total_caldone / total_trial * 100.0) if total_trial > 0 else 0.0},
+        {"Stage": "Payment Received",      "Count": total_pay,     "FromPrev_pct": (total_pay / total_caldone * 100.0) if total_caldone > 0 else 0.0},
     ]
     funnel_df = pd.DataFrame(funnel_rows)
 
@@ -2018,11 +2015,20 @@ elif view == "Stuck deals":
     def fmtd(x): return "–" if pd.isna(x) else f"{x:.1f} days"
     g1, g2, g3 = st.columns(3)
     with g1:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Created → Trial</div><div class='kpi-value'>{fmtd(avg_ct)}</div></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='kpi-card'><div class='kpi-title'>Created → Trial</div><div class='kpi-value'>{fmtd(avg_ct)}</div></div>",
+            unsafe_allow_html=True
+        )
     with g2:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Trial → Cal Done</div><div class='kpi-value'>{fmtd(avg_tc)}</div></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='kpi-card'><div class='kpi-title'>Trial → Cal Done</div><div class='kpi-value'>{fmtd(avg_tc)}</div></div>",
+            unsafe_allow_html=True
+        )
     with g3:
-        st.markdown(f"<div class='kpi-card'><div class='kpi-title'>Cal Done → Payment</div><div class='kpi-value'>{fmtd(avg_dp)}</div></div>", unsafe_allow_html=True)
+        st.markdown(
+            f"<div class='kpi-card'><div class='kpi-title'>Cal Done → Payment</div><div class='kpi-value'>{fmtd(avg_dp)}</div></div>",
+            unsafe_allow_html=True
+        )
 
     # ==== Month-on-Month comparison
     st.markdown("### Month-on-Month comparison")
@@ -2060,9 +2066,9 @@ elif view == "Stuck deals":
             "Trial": tr,
             "CalDone": cd,
             "Paid": py,
-            "Trial_from_Created_pct": (tr/ct*100.0) if ct > 0 else 0.0,
-            "CalDone_from_Trial_pct": (cd/tr*100.0) if tr > 0 else 0.0,
-            "Paid_from_CalDone_pct": (py/cd*100.0) if cd > 0 else 0.0,
+            "Trial_from_Created_pct": (tr / ct * 100.0) if ct > 0 else 0.0,
+            "CalDone_from_Trial_pct": (cd / tr * 100.0) if tr > 0 else 0.0,
+            "Paid_from_CalDone_pct": (py / cd * 100.0) if cd > 0 else 0.0,
             "Avg_Created_to_Trial_days": avg1,
             "Avg_Trial_to_CalDone_days": avg2,
             "Avg_CalDone_to_Payment_days": avg3,
@@ -2111,5 +2117,3 @@ elif view == "Stuck deals":
                 file_name="stuck_deals_mom_funnel_propagation.csv",
                 mime="text/csv",
             )
-
-
