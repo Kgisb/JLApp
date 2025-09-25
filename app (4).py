@@ -1900,7 +1900,7 @@ elif view == "Stuck deals":
     range_start, range_end = month_bounds(date(yy, mm, 1))
     st.caption(f"Scope: **{range_start} → {range_end}**")
 
-    else:
+else:
         trailing = st.slider("Trailing window (days)", min_value=7, max_value=60, value=15, step=1)
         range_end = date.today()
         range_start = range_end - timedelta(days=trailing-1)
