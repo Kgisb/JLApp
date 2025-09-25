@@ -1899,9 +1899,7 @@ elif view == "Stuck deals":
                   .astype(str)
                   .tolist()
             )
-    else:
-        all_months = []
-
+    
         if not all_months:
             all_months = [str(pd.Period(date.today(), freq="M"))]
 
