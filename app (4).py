@@ -225,6 +225,8 @@ source_col     = find_col(df, ["JetLearn Deal Source","Deal Source","Source"])
 first_cal_sched_col = find_col(df, ["First Calibration Scheduled Date","First calibration scheduled date","First_Calibration_Scheduled_Date"])
 cal_resched_col     = find_col(df, ["Calibration Rescheduled Date","Calibration rescheduled date","Calibration_Rescheduled_Date"])
 cal_done_col        = find_col(df, ["Calibration Done Date","Calibration done date","Calibration_Done_Date"])
+calibration_slot_col = find_col(df, ["Calibration Slot (Deal)", "Calibration Slot", "Cal Slot (Deal)", "Cal Slot"])
+
 
 if not create_col or not pay_col:
     st.error("Could not find required date columns. Need 'Create Date' and 'Payment Received Date' (or close variants).")
@@ -1904,6 +1906,40 @@ elif view == "Stuck deals":
 
     # Effective trial date = min(First Cal, Rescheduled), NaT-safe
     d["_trial"] = d[["_f", "_r"]].min(axis=1, skipna=True)
+
+    # ==== Filter: Calibration Slot (Deal) — Pre-Book / Sales Book Trial / Both / None
+def _tag_cal_slot(val: object) -> str:
+    if pd.isna(val):
+        return "None/Blank"
+    v = str(val).strip().lower()
+    if v == "" or v == "nan":
+        return "None/Blank"
+    # heuristics: look for the phrases
+    has_pre  = ("pre" in v) and ("book" in v)
+    has_sbt  = (("sales" in v) or ("sale" in v)) and ("book" in v) and ("trial" in v)
+    if has_pre and has_sbt:
+        return "Both"
+    if has_pre:
+        return "Pre-Book"
+    if has_sbt:
+        return "Sales Book Trial"
+    return "Other"
+
+if calibration_slot_col and calibration_slot_col in d.columns:
+    d["_slot_tag"] = d[calibration_slot_col].apply(_tag_cal_slot)
+    slot_options = ["All", "Pre-Book", "Sales Book Trial", "Both", "None/Blank", "Other"]
+    pick_slots = st.multiselect(
+        "Filter • Calibration Slot (Deal)",
+        options=slot_options,
+        default=["All"],
+        help="Show only deals whose Calibration Slot (Deal) is tagged as Pre-Book, Sales Book Trial, Both, None/Blank, or Other."
+    )
+    if "All" not in pick_slots:
+        d = d[d["_slot_tag"].isin(pick_slots)].copy()
+        st.caption(f"Calibration Slot filter applied: {', '.join(pick_slots)} • Rows now: {len(d):,}")
+else:
+    st.info("Calibration Slot (Deal) column not found — slot filter not applied.")
+
 
     # ==== Cohort: deals CREATED within scope
     mask_created = d["_c"].dt.date.between(range_start, range_end)
