@@ -1889,10 +1889,17 @@ elif view == "Stuck deals":
         if not all_months:
             all_months = [str(pd.Period(date.today(), freq="M"))]
 
-        sel_month = st.selectbox("Select month (YYYY-MM)", options=all_months, index=len(all_months)-1)
-        yy, mm = map(int, sel_month.split("-"))
-        range_start, range_end = month_bounds(date(yy, mm, 1))
-        st.caption(f"Scope: **{range_start} → {range_end}**")
+        running_period = str(pd.Period(date.today(), freq="M"))
+if running_period in all_months:
+    default_idx = all_months.index(running_period)
+else:
+    default_idx = len(all_months) - 1
+
+sel_month = st.selectbox("Select month (YYYY-MM)", options=all_months, index=default_idx)
+yy, mm = map(int, sel_month.split("-"))
+range_start, range_end = month_bounds(date(yy, mm, 1))
+st.caption(f"Scope: **{range_start} → {range_end}**")
+
     else:
         trailing = st.slider("Trailing window (days)", min_value=7, max_value=60, value=15, step=1)
         range_end = date.today()
